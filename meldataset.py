@@ -226,8 +226,10 @@ class MelDataset(torch.utils.data.Dataset):
 
         for audio_path in self.data_list:
             mel_cache_path, meta_cache_path = self._mel_cache_paths(audio_path)
+            f0_cache_path = audio_path + "_f0.npy"
             self._remove_file_safely(mel_cache_path)
             self._remove_file_safely(meta_cache_path)
+            self._remove_file_safely(f0_cache_path)
 
     @staticmethod
     def _remove_file_safely(path):
