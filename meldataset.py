@@ -1,10 +1,4 @@
 #coding: utf-8
-"""
-TODO:
-- make TestDataset
-- separate transforms
-"""
-
 import os
 import os.path as osp
 import time
@@ -27,15 +21,10 @@ logger.setLevel(logging.DEBUG)
 np.random.seed(1)
 random.seed(1)
 
-SPECT_PARAMS = {
-    "n_fft": 2048,
-    "win_length": 1200,
-    "hop_length": 300
-}
 MEL_PARAMS = {
     "n_mels": 80,
-    "n_fft": 2048,
-    "win_length": 1200,
+    "n_fft": 1024,
+    "win_length": 1024,
     "hop_length": 300
 }
 
