@@ -21,35 +21,54 @@ logger.setLevel(logging.DEBUG)
 np.random.seed(1)
 random.seed(1)
 
-MEL_PARAMS = {
+DEFAULT_MEL_PARAMS = {
+    "sample_rate": 24000,
     "n_mels": 80,
     "n_fft": 1024,
     "win_length": 1024,
-    "hop_length": 300
+    "hop_length": 300,
 }
 
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
-                 sr=24000,
+                 sr=DEFAULT_MEL_PARAMS["sample_rate"],
+                 mel_params=None,
                  data_augmentation=False,
                  validation=False,
                  verbose=True
                  ):
 
+        self.verbose = verbose
         _data_list = [l[:-1].split('|') for l in data_list]
         self.data_list = [d[0] for d in _data_list]
 
-        self.sr = sr
-        self.to_melspec = torchaudio.transforms.MelSpectrogram(**MEL_PARAMS)
+        mel_params = mel_params or {}
+        if 'win_len' in mel_params and 'win_length' not in mel_params:
+            mel_params['win_length'] = mel_params.pop('win_len')
+
+        self.mel_params = DEFAULT_MEL_PARAMS.copy()
+        self.mel_params.update(mel_params)
+
+        if sr is not None:
+            self.sr = sr
+        else:
+            self.sr = self.mel_params.get('sample_rate', DEFAULT_MEL_PARAMS['sample_rate'])
+
+        # ensure mel spectrogram uses the dataset sample rate
+        self.mel_params['sample_rate'] = self.sr
+
+        if self.verbose:
+            print(f"[MelDataset] Using mel-spectrogram parameters: {self.mel_params}")
+        logger.info("Using mel-spectrogram parameters: %s", self.mel_params)
+
+        self.to_melspec = torchaudio.transforms.MelSpectrogram(**self.mel_params)
 
         self.mean, self.std = -4, 4
         self.data_augmentation = data_augmentation and (not validation)
         self.max_mel_length = 192
         self.mean, self.std = -4, 4
-        
-        self.verbose = verbose
-        
+
         # for silence detection
         self.zero_value = -10 # what the zero value is
         self.bad_F0 = 5 # if less than 5 frames are non-zero, it's a bad F0, try another algorithm
@@ -69,7 +88,7 @@ class MelDataset(torch.utils.data.Dataset):
             if self.verbose:
                 print('Computing F0 for ' + path + '...')
             x = wave_tensor.numpy().astype("double")
-            frame_period = MEL_PARAMS['hop_length'] * 1000 / self.sr
+            frame_period = self.mel_params['hop_length'] * 1000 / self.sr
             _f0, t = pw.harvest(x, self.sr, frame_period=frame_period)
             if sum(_f0 != 0) < self.bad_F0: # this happens when the algorithm fails
                 _f0, t = pw.dio(x, self.sr, frame_period=frame_period) # if harvest fails, try dio
