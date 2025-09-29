@@ -3,8 +3,8 @@ import os
 import os.path as osp
 import time
 import random
+import json
 import numpy as np
-import random
 import soundfile as sf
 import torch
 from torch import nn
@@ -21,35 +21,60 @@ logger.setLevel(logging.DEBUG)
 np.random.seed(1)
 random.seed(1)
 
-MEL_PARAMS = {
+DEFAULT_MEL_PARAMS = {
+    "sample_rate": 24000,
     "n_mels": 80,
     "n_fft": 1024,
     "win_length": 1024,
-    "hop_length": 300
+    "hop_length": 300,
 }
 
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
-                 sr=24000,
+                 sr=DEFAULT_MEL_PARAMS["sample_rate"],
+                 mel_params=None,
                  data_augmentation=False,
                  validation=False,
                  verbose=True
                  ):
 
+        self.verbose = verbose
         _data_list = [l[:-1].split('|') for l in data_list]
         self.data_list = [d[0] for d in _data_list]
 
-        self.sr = sr
-        self.to_melspec = torchaudio.transforms.MelSpectrogram(**MEL_PARAMS)
+        mel_params = mel_params or {}
+        if 'win_len' in mel_params and 'win_length' not in mel_params:
+            mel_params['win_length'] = mel_params.pop('win_len')
+
+        self.mel_params = DEFAULT_MEL_PARAMS.copy()
+        self.mel_params.update(mel_params)
+
+        if sr is not None:
+            self.sr = sr
+        else:
+            self.sr = self.mel_params.get('sample_rate', DEFAULT_MEL_PARAMS['sample_rate'])
+
+        # ensure mel spectrogram uses the dataset sample rate
+        self.mel_params['sample_rate'] = self.sr
+
+        if self.verbose:
+            print(f"[MelDataset] Using mel-spectrogram parameters: {self.mel_params}")
+        logger.info("Using mel-spectrogram parameters: %s", self.mel_params)
+
+        self.to_melspec = torchaudio.transforms.MelSpectrogram(**self.mel_params)
+
+        # cache management helpers
+        self._mel_cache_suffix = "_mel.npy"
+        self._mel_meta_suffix = "_mel_meta.json"
+        self._mel_cache_invalidated = False
+        self._cache_enabled = True
 
         self.mean, self.std = -4, 4
         self.data_augmentation = data_augmentation and (not validation)
         self.max_mel_length = 192
         self.mean, self.std = -4, 4
-        
-        self.verbose = verbose
-        
+
         # for silence detection
         self.zero_value = -10 # what the zero value is
         self.bad_F0 = 5 # if less than 5 frames are non-zero, it's a bad F0, try another algorithm
@@ -58,8 +83,8 @@ class MelDataset(torch.utils.data.Dataset):
         return len(self.data_list)
 
     def path_to_mel_and_label(self, path):
-        wave_tensor = self._load_tensor(path)
-        
+        wave_tensor, wave_sr = self._load_tensor(path)
+
         # use pyworld to get F0
         output_file = path + "_f0.npy"
         # check if the file exists
@@ -69,7 +94,7 @@ class MelDataset(torch.utils.data.Dataset):
             if self.verbose:
                 print('Computing F0 for ' + path + '...')
             x = wave_tensor.numpy().astype("double")
-            frame_period = MEL_PARAMS['hop_length'] * 1000 / self.sr
+            frame_period = self.mel_params['hop_length'] * 1000 / self.sr
             _f0, t = pw.harvest(x, self.sr, frame_period=frame_period)
             if sum(_f0 != 0) < self.bad_F0: # this happens when the algorithm fails
                 _f0, t = pw.dio(x, self.sr, frame_period=frame_period) # if harvest fails, try dio
@@ -83,7 +108,12 @@ class MelDataset(torch.utils.data.Dataset):
             random_scale = 0.5 + 0.5 * np.random.random()
             wave_tensor = random_scale * wave_tensor
 
-        mel_tensor = self.to_melspec(wave_tensor)
+        expected_metadata = self._build_mel_metadata(wave_tensor, wave_sr)
+        mel_tensor = self._load_cached_mel(path, expected_metadata)
+        if mel_tensor is None:
+            mel_tensor = self.to_melspec(wave_tensor)
+            if self._cache_enabled and not self.data_augmentation:
+                self._save_mel_cache(path, mel_tensor, expected_metadata)
         mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
         mel_length = mel_tensor.size(1)
         
@@ -117,7 +147,110 @@ class MelDataset(torch.utils.data.Dataset):
         wave_path = data
         wave, sr = sf.read(wave_path)
         wave_tensor = torch.from_numpy(wave).float()
-        return wave_tensor
+        return wave_tensor, sr
+
+    def _build_mel_metadata(self, wave_tensor, wave_sr):
+        num_samples = int(wave_tensor.shape[0]) if wave_tensor.ndim > 0 else int(wave_tensor.numel())
+        num_channels = int(wave_tensor.shape[1]) if wave_tensor.ndim > 1 else 1
+
+        def _serialize(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, (np.generic,)):
+                return value.item()
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu()
+                return value.item() if value.numel() == 1 else value.tolist()
+            return value
+
+        serialized_params = {k: _serialize(v) for k, v in self.mel_params.items()}
+
+        return {
+            "audio_sample_rate": int(wave_sr),
+            "audio_num_samples": num_samples,
+            "audio_num_channels": num_channels,
+            "dataset_sample_rate": int(self.sr),
+            "mel_params": serialized_params,
+        }
+
+    def _mel_cache_paths(self, path):
+        return path + self._mel_cache_suffix, path + self._mel_meta_suffix
+
+    def _load_cached_mel(self, path, expected_metadata):
+        if not self._cache_enabled or self.data_augmentation:
+            return None
+
+        mel_cache_path, meta_cache_path = self._mel_cache_paths(path)
+
+        if not os.path.isfile(mel_cache_path):
+            # no cached mel available
+            # remove stray metadata file if present to avoid stale comparisons later
+            if os.path.isfile(meta_cache_path) and not self._mel_cache_invalidated:
+                self._invalidate_mel_cache(meta_cache_path, reason="metadata_without_mel")
+            return None
+
+        if not os.path.isfile(meta_cache_path):
+            # stale cache without metadata; invalidate the entire cache once
+            self._invalidate_mel_cache(meta_cache_path, reason="missing_metadata")
+            return None
+
+        try:
+            with open(meta_cache_path, "r", encoding="utf-8") as meta_file:
+                cached_metadata = json.load(meta_file)
+        except (OSError, json.JSONDecodeError):
+            self._invalidate_mel_cache(meta_cache_path, reason="unreadable_metadata")
+            return None
+
+        if cached_metadata != expected_metadata:
+            self._invalidate_mel_cache(meta_cache_path, reason="metadata_mismatch")
+            return None
+
+        try:
+            mel_numpy = np.load(mel_cache_path)
+        except (OSError, ValueError):
+            self._invalidate_mel_cache(mel_cache_path, reason="unreadable_cache")
+            return None
+
+        return torch.from_numpy(mel_numpy)
+
+    def _invalidate_mel_cache(self, reference_path, reason="unknown"):
+        if self._mel_cache_invalidated:
+            # ensure the reference file is removed even on subsequent calls
+            self._remove_file_safely(reference_path)
+            return
+
+        self._mel_cache_invalidated = True
+        if self.verbose:
+            print(f"[MelDataset] Mel cache invalidation triggered ({reason}). Clearing cached spectrograms...")
+        logger.info("Mel cache invalidation triggered (%s). Clearing cached spectrograms.", reason)
+
+        for audio_path in self.data_list:
+            mel_cache_path, meta_cache_path = self._mel_cache_paths(audio_path)
+            f0_cache_path = audio_path + "_f0.npy"
+            self._remove_file_safely(mel_cache_path)
+            self._remove_file_safely(meta_cache_path)
+            self._remove_file_safely(f0_cache_path)
+
+    @staticmethod
+    def _remove_file_safely(path):
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Failed to remove cache file %s: %s", path, exc)
+
+    def _save_mel_cache(self, path, mel_tensor, metadata):
+        mel_cache_path, meta_cache_path = self._mel_cache_paths(path)
+        mel_numpy = mel_tensor.detach().cpu().numpy()
+        try:
+            np.save(mel_cache_path, mel_numpy)
+            with open(meta_cache_path, "w", encoding="utf-8") as meta_file:
+                json.dump(metadata, meta_file, sort_keys=True)
+        except OSError as exc:
+            logger.warning("Failed to save mel cache for %s: %s", path, exc)
 
 class Collater(object):
     """
