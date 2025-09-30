@@ -22,6 +22,14 @@ dataset_params:
     n_fft: 1024
     n_mels: 80
     hop_length: 300
+  # Optional DataLoader overrides. Leave fields as null to accept the defaults.
+  # When left unspecified the loader automatically switches to ``start_method:
+  # spawn`` whenever a CUDA-enabled F0 backend is active so GPU extraction works
+  # inside worker processes without manual tuning.
+  dataloader:
+    start_method: null
+    persistent_workers: null
+    prefetch_factor: null
   f0_params:
     bad_f0_threshold: 5
     zero_fill_value: 0.0

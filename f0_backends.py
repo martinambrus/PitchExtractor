@@ -60,6 +60,10 @@ class BaseF0Backend:
         self.hop_length = hop_length
         self.config = config or {}
         self.verbose = verbose
+        # Indicates whether the backend expects CUDA availability in the
+        # current process.  Individual implementations update this flag when
+        # device preferences change (e.g. after a CPU fallback).
+        self.requires_cuda = False
 
     @property
     def frame_period_ms(self) -> float:
@@ -175,6 +179,8 @@ class CrepeBackend(BaseF0Backend):
                 )
             self._force_gpu = self._device.type == "cuda"
 
+        self.requires_cuda = self._device.type == "cuda"
+
         self.model = self.config.get("model", "full")
         self.step_size_ms = self._coerce_float("step_size_ms", self.frame_period_ms)
         self.fmin = self._coerce_float("fmin", 50.0)
@@ -260,6 +266,7 @@ class CrepeBackend(BaseF0Backend):
             LOGGER.warning("[%s] %s", self.name, warning)
             self._device_fallback_reported = True
         self._device = self._torch.device("cpu")
+        self.requires_cuda = False
         return True
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
@@ -270,6 +277,8 @@ class CrepeBackend(BaseF0Backend):
         base_tensor = self._torch.from_numpy(waveform).unsqueeze(0)
         hop_length = max(1, int(round(self.step_size_ms * sr / 1000.0)))
 
+        outputs = None
+        periodicity = None
         while True:
             try:
                 tensor = base_tensor.to(self._device)
@@ -308,16 +317,19 @@ class CrepeBackend(BaseF0Backend):
                     continue
                 raise
 
-            if self._supports_return_periodicity and self.return_periodicity:
-                f0_tensor, periodicity = outputs
-            else:
-                f0_tensor = outputs
-                periodicity = None
+        if outputs is None:
+            raise BackendComputationError("torchcrepe did not return any outputs")
 
-            if self.use_median_filter > 1:
-                f0_tensor = self._torchcrepe.filter.median(f0_tensor, self.use_median_filter)
-                if periodicity is not None:
-                    periodicity = self._torchcrepe.filter.median(periodicity, self.use_median_filter)
+        if self._supports_return_periodicity and self.return_periodicity:
+            f0_tensor, periodicity = outputs
+        else:
+            f0_tensor = outputs
+            periodicity = None
+
+        if self.use_median_filter > 1:
+            f0_tensor = self._torchcrepe.filter.median(f0_tensor, self.use_median_filter)
+            if periodicity is not None:
+                periodicity = self._torchcrepe.filter.median(periodicity, self.use_median_filter)
 
         f0 = f0_tensor.squeeze(0).detach().cpu().numpy().astype(np.float64)
         if periodicity is not None:
@@ -356,6 +368,7 @@ class RMVPEBackend(BaseF0Backend):
         is_half = bool(self.config.get("is_half", device == "cuda"))
         self._model = RMVPE(model_path, is_half=is_half, device=device) if model_path else RMVPE(is_half=is_half, device=device)
         self._model.eval()
+        self.requires_cuda = str(device).startswith("cuda")
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
@@ -592,6 +605,7 @@ class F0Extractor:
 
         cache_tag_components = [_normalise_backend_name(backend.cache_key) for backend in self.backends]
         self.cache_identifier = "-" + "_".join(cache_tag_components) if cache_tag_components else ""
+        self.requires_cuda = any(getattr(backend, "requires_cuda", False) for backend in self.backends)
 
     # ------------------------------------------------------------------
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> BackendResult:

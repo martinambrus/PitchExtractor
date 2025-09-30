@@ -33,10 +33,12 @@ Whenever the backend configuration changes the dataset automatically regenerates
 #### Backend configuration summary
 
 - **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.
-- **TorchCrepe (CREPE)** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, constrain the search range via `fmin`/`fmax`, and tune batching (`batch_size`), padding, and optional `median_filter_size`. Enable `return_periodicity` to obtain confidence scores and zero out low-confidence frames with `periodicity_threshold`. `device` accepts `auto` (prefer CUDA) or an explicit torch device string such as `cpu`, `cuda`, or `cuda:1`.
+- **TorchCrepe (CREPE)** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, constrain the search range via `fmin`/`fmax`, and tune batching (`batch_size`), padding, and optional `median_filter_size`. Enable `return_periodicity` to obtain confidence scores and zero out low-confidence frames with `periodicity_threshold`. `device` accepts `auto` (prefer CUDA) or an explicit torch device string such as `cpu`, `cuda`, or `cuda:1`. When any enabled backend requests CUDA the dataloader automatically switches to the `spawn` multiprocessing context so TorchCrepe/RMVPE can initialise GPUs inside worker processes; override this behaviour via `dataset_params.dataloader.start_method` if necessary.
 - **RMVPE** – Provide `model_path` for custom checkpoints, select the execution `device`, and enable `is_half` to use the half-precision weights when running on CUDA.
 - **Praat / Parselmouth** – Set the `method` (e.g., `ac`, `cc`), `min_pitch`/`max_pitch` bounds, and adjust `silence_threshold` and `voicing_threshold` for sensitivity.
 - **REAPER** – Limit the search range with `min_pitch`/`max_pitch` and toggle `do_high_pass` to suppress low-frequency noise before analysis.
+
+The optional `dataset_params.dataloader` dictionary lets you fine-tune how the `DataLoader` is constructed (for example, setting `start_method`, `persistent_workers`, or `prefetch_factor`). When omitted the builder keeps PyTorch defaults, only forcing `start_method: spawn` when CUDA-enabled F0 backends would otherwise hit the "Cannot re-initialize CUDA in forked subprocess" error.
 
 ### Data Augmentation
 Data augmentation is not included in this code. For better voice conversion results, please add your own data augmentation in [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py) with [audiomentations](https://github.com/iver56/audiomentations).

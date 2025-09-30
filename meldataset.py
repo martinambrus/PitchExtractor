@@ -77,6 +77,7 @@ class MelDataset(torch.utils.data.Dataset):
         except Exception as exc:
             raise RuntimeError(f"Failed to initialise F0 extractor: {exc}") from exc
 
+        self.requires_cuda_backend = getattr(self.f0_extractor, "requires_cuda", False)
         self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
         self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
         if self.verbose:
@@ -405,18 +406,45 @@ def build_dataloader(path_list,
                      batch_size=4,
                      num_workers=1,
                      device='cpu',
-                     collate_config={},
-                     dataset_config={}):
-    
-    dataset = MelDataset(path_list, validation=validation, **dataset_config)
-    collate_fn = Collater(**collate_config)
+                     collate_config=None,
+                     dataset_config=None):
 
-    data_loader = DataLoader(dataset,
-                             batch_size=batch_size,
-                             shuffle=(not validation),
-                             num_workers=num_workers,
-                             drop_last=(not validation),
-                             collate_fn=collate_fn,
-                             pin_memory=(device != 'cpu'))
+    dataset_config = dict(dataset_config or {})
+    dataloader_options = dataset_config.pop('dataloader', {}) or {}
+
+    dataset = MelDataset(path_list, validation=validation, **dataset_config)
+    collate_fn = Collater(**(collate_config or {}))
+
+    loader_kwargs = dict(
+        batch_size=batch_size,
+        shuffle=(not validation),
+        num_workers=num_workers,
+        drop_last=(not validation),
+        collate_fn=collate_fn,
+        pin_memory=(device != 'cpu'),
+    )
+
+    start_method = dataloader_options.get('start_method')
+    if start_method is None and num_workers > 0 and dataset.requires_cuda_backend:
+        start_method = 'spawn'
+        if dataset.verbose:
+            print("[MelDataset] Using 'spawn' multiprocessing context for CUDA-enabled F0 backends.")
+
+    if start_method:
+        try:
+            multiprocessing_context = torch.multiprocessing.get_context(start_method)
+        except RuntimeError as exc:
+            raise RuntimeError(f"Invalid DataLoader start method '{start_method}': {exc}") from exc
+        loader_kwargs['multiprocessing_context'] = multiprocessing_context
+
+    persistent_workers = dataloader_options.get('persistent_workers')
+    if persistent_workers is not None and num_workers > 0:
+        loader_kwargs['persistent_workers'] = bool(persistent_workers)
+
+    prefetch_factor = dataloader_options.get('prefetch_factor')
+    if prefetch_factor is not None and num_workers > 0:
+        loader_kwargs['prefetch_factor'] = int(prefetch_factor)
+
+    data_loader = DataLoader(dataset, **loader_kwargs)
 
     return data_loader
