@@ -25,15 +25,39 @@ dataset_params:
   f0_params:
     bad_f0_threshold: 5
     zero_fill_value: 0.0
+    # Ordered list of backend names to try when computing F0. Each entry must
+    # match a key below in the ``backends`` dictionary and will be attempted in
+    # sequence until one produces a valid contour.
     backend_order:
+      # PyWorld's Harvest tracker prioritises accuracy and can optionally fall
+      # back to a secondary algorithm (e.g. DIO) when it produces too few voiced
+      # frames for a clip.
       - pyworld_harvest
+      # PyWorld's DIO tracker is faster than Harvest and is a common baseline.
       - pyworld_dio
+      # CREPE is a neural-network F0 estimator that works well on singing voice
+      # and noisy material. Enable it when you have the dependency installed and
+      # want a data-driven approach.
       - crepe
+      # RMVPE is a deep learning based tracker that provides high accuracy at
+      # the cost of GPU resources. Configure ``device`` to "cuda" or "cpu" and
+      # optionally supply a custom model checkpoint path.
       - rmvpe
+      # Praat accesses the classic signal-processing F0 algorithms via the
+      # parselmouth bindings. The ``method`` parameter accepts values like
+      # "ac" (autocorrelation) or "cc" (cross-correlation).
       - praat
+      # REAPER is robust for speech with glottal closures and exposes simple
+      # minimum/maximum pitch bounds plus an optional high-pass filter.
       - reaper
+      # Native parselmouth backend mirroring Praat's algorithm selection.
       - parselmouth
     backends:
+      # Harvest configuration (PyWorld). Toggle ``enabled`` to include/exclude
+      # the backend. ``algorithm`` can be "harvest", "dio", or "stonemask".
+      # ``fallback`` specifies another PyWorld algorithm to try when the first
+      # run returns mostly unvoiced frames. ``stonemask`` enables the refinement
+      # pass after the main extraction.
       pyworld_harvest:
         type: pyworld
         enabled: true
@@ -41,6 +65,8 @@ dataset_params:
           algorithm: harvest
           fallback: dio
           stonemask: true
+      # DIO configuration (PyWorld). Set ``fallback`` to another algorithm name
+      # (or null to disable) and toggle ``stonemask`` for optional refinement.
       pyworld_dio:
         type: pyworld
         enabled: true
@@ -48,6 +74,10 @@ dataset_params:
           algorithm: dio
           fallback: null
           stonemask: true
+      # CREPE neural F0. ``model`` accepts "tiny", "small", "medium", or
+      # "full". ``step_size_ms`` controls the analysis hop in milliseconds.
+      # ``viterbi`` smooths the contour, and ``confidence_threshold`` zeroes
+      # frames below the specified probability.
       crepe:
         type: crepe
         enabled: false
@@ -56,6 +86,9 @@ dataset_params:
           step_size_ms: null
           viterbi: true
           confidence_threshold: 0.1
+      # RMVPE deep learning F0. ``model_path`` allows a custom checkpoint.
+      # ``device`` can be "cuda" or "cpu". ``is_half`` loads the half-precision
+      # weights when GPU memory is constrained.
       rmvpe:
         type: rmvpe
         enabled: false
@@ -63,6 +96,11 @@ dataset_params:
           model_path: null
           device: null
           is_half: true
+      # Praat backend via parselmouth. ``method`` matches Praat's choices such
+      # as "ac" (autocorrelation) or "cc" (cross-correlation). ``min_pitch`` and
+      # ``max_pitch`` set the allowed frequency range in Hertz. The
+      # ``silence_threshold`` and ``voicing_threshold`` values control
+      # voiced/unvoiced detection sensitivity.
       praat:
         type: praat
         enabled: false
@@ -72,6 +110,9 @@ dataset_params:
           max_pitch: 1100.0
           silence_threshold: 0.03
           voicing_threshold: 0.45
+      # REAPER backend. Adjust the pitch bounds for your dataset and toggle the
+      # optional ``do_high_pass`` filter when dealing with very low-frequency
+      # noise.
       reaper:
         type: reaper
         enabled: false
@@ -79,6 +120,9 @@ dataset_params:
           min_pitch: 40.0
           max_pitch: 600.0
           do_high_pass: true
+      # Native parselmouth wrapper. Accepts the same ``method``/threshold
+      # options as Praat but can be configured independently if you want a
+      # different parameter set.
       parselmouth:
         type: parselmouth
         enabled: false

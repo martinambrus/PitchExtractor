@@ -30,6 +30,14 @@ Since both `harvest` and `dio` are relatively slow, we do have to save the compu
 
 Whenever the backend configuration changes the dataset automatically regenerates cached pitch files under backend-specific filenames and stores a small JSON metadata file alongside each cache to keep track of the extractor that produced it. Failed extraction attempts fall back to the next enabled backend until a valid contour with sufficient voiced frames is produced. If all backends fail the sample is logged and the stored F0 is left empty (zeros after post-processing), so you may want to audit those cases if they occur frequently.
 
+#### Backend configuration summary
+
+- **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.
+- **CREPE** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, toggle `viterbi` smoothing, and set a `confidence_threshold` to zero low-confidence frames.
+- **RMVPE** – Provide `model_path` for custom checkpoints, select the execution `device`, and enable `is_half` to use the half-precision weights when running on CUDA.
+- **Praat / Parselmouth** – Set the `method` (e.g., `ac`, `cc`), `min_pitch`/`max_pitch` bounds, and adjust `silence_threshold` and `voicing_threshold` for sensitivity.
+- **REAPER** – Limit the search range with `min_pitch`/`max_pitch` and toggle `do_high_pass` to suppress low-frequency noise before analysis.
+
 ### Data Augmentation
 Data augmentation is not included in this code. For better voice conversion results, please add your own data augmentation in [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py) with [audiomentations](https://github.com/iver56/audiomentations).
 

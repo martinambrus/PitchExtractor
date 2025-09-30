@@ -16,6 +16,7 @@ another backend defined in the configuration.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 import re
 from typing import Dict, List, Optional
@@ -159,23 +160,53 @@ class CrepeBackend(BaseF0Backend):
         self.center = bool(self.config.get("center", True))
         self.confidence_threshold = self._coerce_float("confidence_threshold", 0.05)
         self.step_size_ms = self._coerce_float("step_size_ms", self.frame_period_ms)
+        # Older CREPE releases used ``model_capacity`` instead of ``model`` and
+        # ``hop_length`` instead of ``step_size``.  Introspect the callable so we
+        # can adapt automatically and avoid runtime ``TypeError`` exceptions when
+        # users install a different version of the dependency.
+        signature = inspect.signature(self._crepe.predict)
+        self._predict_params = set(signature.parameters)
+        if "model" in self._predict_params:
+            self._model_kwarg = "model"
+        elif "model_capacity" in self._predict_params:
+            self._model_kwarg = "model_capacity"
+        else:
+            self._model_kwarg = None
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
         waveform = audio.astype(np.float32, copy=False)
-        time, frequency, confidence, _ = self._crepe.predict(
-            waveform,
-            sr,
-            model=self.model,
-            step_size=self.step_size_ms,
-            center=self.center,
-            viterbi=self.viterbi,
-            verbose=0,
-        )
+        kwargs: Dict[str, object] = {}
+        if self._model_kwarg:
+            kwargs[self._model_kwarg] = self.model
+        if "step_size" in self._predict_params:
+            kwargs["step_size"] = self.step_size_ms
+        elif "hop_length" in self._predict_params:
+            hop_length = max(1, int(round(self.step_size_ms * sr / 1000.0)))
+            kwargs["hop_length"] = hop_length
+        if "center" in self._predict_params:
+            kwargs["center"] = self.center
+        if "viterbi" in self._predict_params:
+            kwargs["viterbi"] = self.viterbi
+        if "verbose" in self._predict_params:
+            kwargs["verbose"] = 0
+
+        outputs = self._crepe.predict(waveform, sr, **kwargs)
+        if isinstance(outputs, tuple):
+            time = outputs[0]
+            frequency = outputs[1]
+            confidence = outputs[2] if len(outputs) > 2 else np.ones_like(frequency)
+        else:
+            frequency = np.asarray(outputs)
+            frame_period = self.step_size_ms / 1000.0
+            time = np.arange(frequency.shape[0], dtype=np.float32) * frame_period
+            confidence = np.ones_like(frequency)
+
         f0 = frequency.astype(np.float64)
-        if self.confidence_threshold > 0:
-            f0[confidence < self.confidence_threshold] = 0.0
-        self.log(f"CREPE analysed {len(time)} frames with mean confidence {confidence.mean():.3f}.")
+        if self.confidence_threshold > 0 and confidence is not None:
+            f0[np.asarray(confidence) < self.confidence_threshold] = 0.0
+        mean_conf = float(np.asarray(confidence).mean()) if confidence is not None else 1.0
+        self.log(f"CREPE analysed {len(time)} frames with mean confidence {mean_conf:.3f}.")
         return f0
 
 
