@@ -62,7 +62,15 @@ class BaseF0Backend:
 
     @property
     def frame_period_ms(self) -> float:
-        return float(self.config.get("frame_period_ms", self.hop_length * 1000.0 / self.sample_rate))
+        value = self.config.get("frame_period_ms")
+        if value is None:
+            value = self.hop_length * 1000.0 / self.sample_rate
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid float value for 'frame_period_ms' in backend '{self.name}': {value!r}"
+            ) from exc
 
     @property
     def cache_key(self) -> str:
@@ -75,6 +83,17 @@ class BaseF0Backend:
         if self.verbose:
             print(f"[{self.name}] {message}")
         LOGGER.debug("[%s] %s", self.name, message)
+
+    def _coerce_float(self, key: str, default: float) -> float:
+        value = self.config.get(key, default)
+        if value is None:
+            value = default
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid float value for '{key}' in backend '{self.name}': {value!r}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # API surface expected from subclasses
@@ -138,8 +157,8 @@ class CrepeBackend(BaseF0Backend):
         self.model = self.config.get("model", "full")
         self.viterbi = bool(self.config.get("viterbi", True))
         self.center = bool(self.config.get("center", True))
-        self.confidence_threshold = float(self.config.get("confidence_threshold", 0.05))
-        self.step_size_ms = float(self.config.get("step_size_ms", self.frame_period_ms))
+        self.confidence_threshold = self._coerce_float("confidence_threshold", 0.05)
+        self.step_size_ms = self._coerce_float("step_size_ms", self.frame_period_ms)
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
@@ -200,11 +219,11 @@ class PraatBackend(BaseF0Backend):
             raise BackendUnavailableError("parselmouth (Praat bindings) is not installed") from exc
 
         self._parselmouth = parselmouth
-        self.min_pitch = float(self.config.get("min_pitch", 40.0))
-        self.max_pitch = float(self.config.get("max_pitch", 1100.0))
-        self.silence_threshold = float(self.config.get("silence_threshold", 0.03))
-        self.voicing_threshold = float(self.config.get("voicing_threshold", 0.45))
-        self.octave_cost = float(self.config.get("octave_cost", 0.01))
+        self.min_pitch = self._coerce_float("min_pitch", 40.0)
+        self.max_pitch = self._coerce_float("max_pitch", 1100.0)
+        self.silence_threshold = self._coerce_float("silence_threshold", 0.03)
+        self.voicing_threshold = self._coerce_float("voicing_threshold", 0.45)
+        self.octave_cost = self._coerce_float("octave_cost", 0.01)
         self.pitch_unit = self.config.get("unit", "Hertz")
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
@@ -235,8 +254,8 @@ class ReaperBackend(BaseF0Backend):
             raise BackendUnavailableError("pyreaper is not installed") from exc
 
         self._reaper = pyreaper
-        self.min_f0 = float(self.config.get("min_pitch", 40.0))
-        self.max_f0 = float(self.config.get("max_pitch", 600.0))
+        self.min_f0 = self._coerce_float("min_pitch", 40.0)
+        self.max_f0 = self._coerce_float("max_pitch", 600.0)
         self.do_high_pass = bool(self.config.get("do_high_pass", True))
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
@@ -311,7 +330,13 @@ class F0Extractor:
         self.verbose = verbose
         config = config or {}
         self.bad_f0_threshold = int(config.get("bad_f0_threshold", 5))
-        self.zero_fill_value = float(config.get("zero_fill_value", 0.0))
+        zero_fill = config.get("zero_fill_value", 0.0)
+        if zero_fill is None:
+            zero_fill = 0.0
+        try:
+            self.zero_fill_value = float(zero_fill)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid zero_fill_value: {zero_fill!r}") from exc
 
         backends_config = config.get("backends") or {}
         sequence_config = config.get("backend_order")
