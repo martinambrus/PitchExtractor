@@ -12,7 +12,18 @@ cd PitchExtractor
 ```bash
 pip install SoundFile torchaudio torch pyyaml click matplotlib librosa pyworld
 ```
-4. Prepare your own dataset and put the `train_list.txt` and `val_list.txt` in the `Data` folder (see Training section for more details).
+4. (Optional) Install extra dependencies for alternative F0 backends:
+
+   | Backend        | Installation command / notes |
+   | -------------- | ----------------------------- |
+   | TorchCrepe     | `pip install torchcrepe` |
+   | RMVPE          | Follow the [RMVPE project](https://github.com/RVC-Project/RMVPE) instructions (no PyPI release as of writing). |
+   | Praat / Parselmouth | `pip install praat-parselmouth` |
+   | REAPER         | `pip install pyreaper` (requires a C++ build toolchain) |
+
+   These packages are only needed when you enable the corresponding backend in `Configs/config.yml`. The training pipeline will gracefully skip any backend whose dependency is missing.
+
+5. Prepare your own dataset and put the `train_list.txt` and `val_list.txt` in the `Data` folder (see Training section for more details).
 
 ## Training
 ```bash
