@@ -519,7 +519,7 @@ class ReaperBackend(BaseF0Backend):
         else:
             signal = signal.astype(np.int16, copy=False)
         frame_period_sec = self.frame_period_ms / 1000.0
-        times, f0, _, vuv = self._reaper.reaper(
+        outputs = self._reaper.reaper(
             signal,
             sr,
             minf0=self.min_f0,
@@ -527,7 +527,18 @@ class ReaperBackend(BaseF0Backend):
             frame_period=frame_period_sec,
             do_high_pass=self.do_high_pass,
         )
-        f0 = f0.astype(np.float64)
+
+        try:
+            times, f0, _, vuv = outputs
+        except ValueError:
+            if len(outputs) < 4:
+                raise
+            times = outputs[0]
+            f0 = outputs[1]
+            vuv = outputs[3]
+
+        f0 = np.asarray(f0, dtype=np.float64)
+        vuv = np.asarray(vuv)
         f0[vuv == 0] = 0.0
         return f0
 
