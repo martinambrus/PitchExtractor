@@ -16,6 +16,7 @@ another backend defined in the configuration.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 import re
 from typing import Dict, List, Optional
@@ -180,12 +181,46 @@ class CrepeBackend(BaseF0Backend):
         self.fmax = self._coerce_float("fmax", 1100.0)
         self.batch_size = int(self.config.get("batch_size", 1024) or 1024)
         self.pad = bool(self.config.get("pad", True))
-        self.pad_mode = str(self.config.get("pad_mode", "reflect"))
+        raw_pad_mode = self.config.get("pad_mode", "reflect")
+        self.pad_mode = None if raw_pad_mode is None else str(raw_pad_mode)
         self.return_periodicity = bool(self.config.get("return_periodicity", True))
         self.periodicity_threshold = self._coerce_float("periodicity_threshold", 0.1)
         self.use_median_filter = int(self.config.get("median_filter_size", 0) or 0)
         if self.use_median_filter < 0:
             raise ValueError("median_filter_size must be >= 0")
+
+        # ``torchcrepe.predict`` gains new keyword arguments over time.  Older
+        # releases will raise ``TypeError`` when unexpected keywords are passed,
+        # so we introspect the installed version once and only forward supported
+        # options during inference.
+        predict_signature = inspect.signature(self._torchcrepe.predict)
+        self._predict_params = set(predict_signature.parameters)
+
+        self._supports_batch_size = "batch_size" in self._predict_params
+        self._supports_device = "device" in self._predict_params
+        self._supports_pad = "pad" in self._predict_params
+        self._supports_pad_mode = "pad_mode" in self._predict_params
+        self._supports_return_periodicity = "return_periodicity" in self._predict_params
+
+        if not self._supports_pad and self.pad:
+            message = "Installed torchcrepe version does not support 'pad'; disabling padding."
+            self.log(message)
+            LOGGER.warning("[%s] %s", self.name, message)
+            self.pad = False
+
+        if not self._supports_pad_mode and self.pad_mode is not None:
+            message = "Installed torchcrepe version does not support 'pad_mode'; ignoring configuration."
+            self.log(message)
+            LOGGER.warning("[%s] %s", self.name, message)
+            self.pad_mode = None
+
+        if not self._supports_return_periodicity and self.return_periodicity:
+            message = (
+                "Installed torchcrepe version does not support periodicity outputs; disabling confidence filtering."
+            )
+            self.log(message)
+            LOGGER.warning("[%s] %s", self.name, message)
+            self.return_periodicity = False
 
         # Track whether we have already warned about falling back to CPU when
         # CUDA initialisation fails inside a forked worker (e.g. PyTorch
@@ -245,18 +280,27 @@ class CrepeBackend(BaseF0Backend):
 
             try:
                 with self._torch.no_grad():  # pragma: no cover - heavy dependency
+                    predict_kwargs = {
+                        "fmin": self.fmin,
+                        "fmax": self.fmax,
+                        "model": self.model,
+                    }
+                    if self._supports_batch_size:
+                        predict_kwargs["batch_size"] = self.batch_size
+                    if self._supports_device:
+                        predict_kwargs["device"] = self._device
+                    if self._supports_pad:
+                        predict_kwargs["pad"] = self.pad
+                    if self._supports_pad_mode and self.pad_mode is not None:
+                        predict_kwargs["pad_mode"] = self.pad_mode
+                    if self._supports_return_periodicity:
+                        predict_kwargs["return_periodicity"] = self.return_periodicity
+
                     outputs = self._torchcrepe.predict(
                         tensor,
                         sr,
                         hop_length,
-                        fmin=self.fmin,
-                        fmax=self.fmax,
-                        model=self.model,
-                        batch_size=self.batch_size,
-                        device=self._device,
-                        pad=self.pad,
-                        pad_mode=self.pad_mode,
-                        return_periodicity=self.return_periodicity,
+                        **predict_kwargs,
                     )
                 break
             except RuntimeError as exc:
@@ -264,7 +308,7 @@ class CrepeBackend(BaseF0Backend):
                     continue
                 raise
 
-            if self.return_periodicity:
+            if self._supports_return_periodicity and self.return_periodicity:
                 f0_tensor, periodicity = outputs
             else:
                 f0_tensor = outputs
