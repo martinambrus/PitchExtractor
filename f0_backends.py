@@ -528,23 +528,26 @@ class ReaperBackend(BaseF0Backend):
             if not np.all(np.isfinite(signal)):
                 signal = np.nan_to_num(signal, copy=False)
             signal = np.clip(signal, -1.0, 1.0)
-            signal = np.round(signal * info.max).astype(np.int16)
+            signal = np.round(signal * info.max).astype(np.int16, copy=False)
         elif np.issubdtype(signal.dtype, np.integer):
             if signal.dtype != np.int16:
                 signal = signal.astype(np.int64, copy=False)
-                signal = np.clip(signal, info.min, info.max).astype(np.int16)
-            else:
-                # Copy to ensure we hand pyreaper an exclusive, contiguous buffer.
-                signal = signal.copy()
+                signal = np.clip(signal, info.min, info.max).astype(np.int16, copy=False)
         else:
             # Fallback for other dtypes (e.g. complex) by casting through float.
             signal = np.asarray(signal, dtype=np.float64)
             if not np.all(np.isfinite(signal)):
                 signal = np.nan_to_num(signal, copy=False)
             signal = np.clip(signal, -1.0, 1.0)
-            signal = np.round(signal * info.max).astype(np.int16)
+            signal = np.round(signal * info.max).astype(np.int16, copy=False)
 
-        signal = np.ascontiguousarray(signal)
+        # ``pyreaper`` interacts with the raw memory buffer supplied by NumPy.
+        # Ensure the array owns its data, is C-contiguous, and remains writable
+        # to avoid pyreaper mutating or freeing a shared view which would
+        # otherwise trigger heap corruption (observed as "malloc(): corrupted"
+        # errors when REAPER attempts to invert the signal).
+        signal = np.require(signal, dtype=np.int16, requirements=("C", "W", "O"))
+
         frame_period_sec = self.frame_period_ms / 1000.0
         outputs = self._reaper.reaper(
             signal,
