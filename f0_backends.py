@@ -360,26 +360,96 @@ class PraatBackend(BaseF0Backend):
             raise BackendUnavailableError("parselmouth (Praat bindings) is not installed") from exc
 
         self._parselmouth = parselmouth
+        self._praat = parselmouth.praat
         self.min_pitch = self._coerce_float("min_pitch", 40.0)
         self.max_pitch = self._coerce_float("max_pitch", 1100.0)
         self.silence_threshold = self._coerce_float("silence_threshold", 0.03)
         self.voicing_threshold = self._coerce_float("voicing_threshold", 0.45)
         self.octave_cost = self._coerce_float("octave_cost", 0.01)
+        self.octave_jump_cost = self._coerce_float("octave_jump_cost", 1.0)
+        self.voiced_unvoiced_cost = self._coerce_float("voiced_unvoiced_cost", 0.3)
         self.pitch_unit = self.config.get("unit", "Hertz")
+        self.very_accurate = _coerce_enabled_flag(self.config.get("very_accurate", False))
+        self._raw_method = self.config.get("method")
+        self._method_key = self._normalise_method(self._raw_method)
+
+    @staticmethod
+    def _normalise_method(method_value: Optional[object]) -> Optional[str]:
+        if method_value is None:
+            return None
+        text = str(method_value).strip().lower()
+        if not text:
+            return None
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    def _resolve_method_enum(self, method_value):
+        if method_value is None:
+            return None
+        enum_cls = getattr(self._parselmouth.Sound, "ToPitchMethod", None)
+        if enum_cls is None:
+            return None
+        if isinstance(method_value, enum_cls):  # pragma: no cover - defensive
+            return method_value
+        method_key = self._normalise_method(method_value)
+        if method_key is None:
+            return None
+        for attr in dir(enum_cls):
+            if attr.startswith("_"):
+                continue
+            try:
+                candidate = getattr(enum_cls, attr)
+            except AttributeError:  # pragma: no cover - defensive
+                continue
+            if not isinstance(candidate, enum_cls):
+                continue
+            attr_key = re.sub(r"[^a-z0-9]+", "", attr.lower())
+            if method_key == attr_key:
+                return candidate
+        return None
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
         sound = self._parselmouth.Sound(audio, sampling_frequency=sr)
-        pitch = sound.to_pitch(
-            time_step=self.frame_period_ms / 1000.0,
-            pitch_floor=self.min_pitch,
-            pitch_ceiling=self.max_pitch,
-            method=self.config.get("method", "ac"),
-            silence_threshold=self.silence_threshold,
-            voicing_threshold=self.voicing_threshold,
-            octave_cost=self.octave_cost,
-            unit=self.pitch_unit,
-        )
+        time_step = self.frame_period_ms / 1000.0
+        method_key = self._method_key
+        if method_key in {"ac", "autocorrelation"}:
+            pitch = self._praat.call(
+                sound,
+                "To Pitch (ac)",
+                time_step,
+                self.min_pitch,
+                self.max_pitch,
+                self.very_accurate,
+                self.silence_threshold,
+                self.voicing_threshold,
+                self.octave_cost,
+                self.octave_jump_cost,
+                self.voiced_unvoiced_cost,
+            )
+        elif method_key in {"cc", "crosscorrelation"}:
+            pitch = self._praat.call(
+                sound,
+                "To Pitch (cc)",
+                time_step,
+                self.min_pitch,
+                self.max_pitch,
+                self.very_accurate,
+                self.silence_threshold,
+                self.voicing_threshold,
+                self.octave_cost,
+                self.octave_jump_cost,
+                self.voiced_unvoiced_cost,
+            )
+        else:
+            method_enum = self._resolve_method_enum(self._raw_method)
+            kwargs = {
+                "time_step": time_step,
+                "pitch_floor": self.min_pitch,
+                "pitch_ceiling": self.max_pitch,
+            }
+            if method_enum is not None:
+                kwargs["method"] = method_enum
+            pitch = sound.to_pitch(**kwargs)
         f0 = pitch.selected_array[self.pitch_unit.lower()].astype(np.float64)
         return f0
 
