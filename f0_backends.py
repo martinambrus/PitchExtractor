@@ -360,7 +360,6 @@ class PraatBackend(BaseF0Backend):
             raise BackendUnavailableError("parselmouth (Praat bindings) is not installed") from exc
 
         self._parselmouth = parselmouth
-        self._praat = parselmouth.praat
         self.min_pitch = self._coerce_float("min_pitch", 40.0)
         self.max_pitch = self._coerce_float("max_pitch", 1100.0)
         self.silence_threshold = self._coerce_float("silence_threshold", 0.03)
@@ -413,32 +412,28 @@ class PraatBackend(BaseF0Backend):
         time_step = self.frame_period_ms / 1000.0
         method_key = self._method_key
         if method_key in {"ac", "autocorrelation"}:
-            pitch = self._praat.call(
-                sound,
-                "To Pitch (ac)",
-                time_step,
-                self.min_pitch,
-                self.max_pitch,
-                self.very_accurate,
-                self.silence_threshold,
-                self.voicing_threshold,
-                self.octave_cost,
-                self.octave_jump_cost,
-                self.voiced_unvoiced_cost,
+            pitch = sound.to_pitch_ac(
+                time_step=time_step,
+                pitch_floor=self.min_pitch,
+                pitch_ceiling=self.max_pitch,
+                very_accurate=self.very_accurate,
+                silence_threshold=self.silence_threshold,
+                voicing_threshold=self.voicing_threshold,
+                octave_cost=self.octave_cost,
+                octave_jump_cost=self.octave_jump_cost,
+                voiced_unvoiced_cost=self.voiced_unvoiced_cost,
             )
         elif method_key in {"cc", "crosscorrelation"}:
-            pitch = self._praat.call(
-                sound,
-                "To Pitch (cc)",
-                time_step,
-                self.min_pitch,
-                self.max_pitch,
-                self.very_accurate,
-                self.silence_threshold,
-                self.voicing_threshold,
-                self.octave_cost,
-                self.octave_jump_cost,
-                self.voiced_unvoiced_cost,
+            pitch = sound.to_pitch_cc(
+                time_step=time_step,
+                pitch_floor=self.min_pitch,
+                pitch_ceiling=self.max_pitch,
+                very_accurate=self.very_accurate,
+                silence_threshold=self.silence_threshold,
+                voicing_threshold=self.voicing_threshold,
+                octave_cost=self.octave_cost,
+                octave_jump_cost=self.octave_jump_cost,
+                voiced_unvoiced_cost=self.voiced_unvoiced_cost,
             )
         else:
             method_enum = self._resolve_method_enum(self._raw_method)
