@@ -313,13 +313,27 @@ class F0Extractor:
         self.bad_f0_threshold = int(config.get("bad_f0_threshold", 5))
         self.zero_fill_value = float(config.get("zero_fill_value", 0.0))
 
-        sequence = config.get("backend_order") or [entry["name"] for entry in self.DEFAULT_SEQUENCE]
-        backends_config = config.get("backends", {})
+        backends_config = config.get("backends") or {}
+        sequence_config = config.get("backend_order")
+        if sequence_config:
+            sequence = list(sequence_config)
+        elif backends_config:
+            # Preserve the declaration order from the config mapping when no
+            # explicit sequence is provided.
+            sequence = list(backends_config.keys())
+        else:
+            sequence = [entry["name"] for entry in self.DEFAULT_SEQUENCE]
 
-        # Merge defaults with user configuration so that the default sequence
-        # always works even when users omit explicit backend definitions.
+        # Merge defaults with user configuration.  Built-in defaults are only
+        # applied when the user does not provide any backend configuration at
+        # all; otherwise we respect the explicitly declared backends and skip
+        # any names without a matching entry.  This prevents disabled backends
+        # from silently reappearing when users trim the config down to a subset
+        # of backends.
         defaults: Dict[str, Dict] = {entry["name"]: entry for entry in self.DEFAULT_SEQUENCE}
         merged_sequence: List[Dict] = []
+        use_defaults_for_missing = not bool(backends_config)
+
         for raw_name in sequence:
             if isinstance(raw_name, dict):
                 entry = dict(raw_name)
@@ -327,9 +341,17 @@ class F0Extractor:
                 merged_sequence.append(entry)
                 continue
             name = str(raw_name)
-            backend_cfg = backends_config.get(name, {})
+            backend_cfg = backends_config.get(name)
+            if backend_cfg is None and not use_defaults_for_missing:
+                # When the user provided at least one backend configuration we
+                # assume any names missing from ``backends`` are intentionally
+                # disabled.  Skip them instead of resurrecting the default
+                # definition so the runtime chain mirrors the configuration.
+                LOGGER.debug("Skipping backend '%s' because it is not defined in config", name)
+                continue
+
             default_entry = defaults.get(name, {"name": name, "type": name})
-            merged_entry = {**default_entry, **backend_cfg}
+            merged_entry = {**default_entry, **(backend_cfg or {})}
             merged_entry.setdefault("name", name)
             merged_entry.setdefault("type", merged_entry.get("backend", merged_entry.get("type", name)))
             merged_entry["enabled"] = _coerce_enabled_flag(merged_entry.get("enabled", True))
