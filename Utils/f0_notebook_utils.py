@@ -1,14 +1,10 @@
-"""Helper utilities shared across the evaluation notebooks.
+"""Shared helpers for Notebook-based evaluations.
 
 The notebooks under ``Utils`` historically re-implemented small slices of the
 dataset preprocessing pipeline which made it difficult to keep them in sync
 whenever we added new functionality.  This module mirrors the key bits of the
 runtime code (F0 extraction, resampling, cache configuration) so that the
 notebooks stay aligned with the training stack.
-"""Shared helpers for Notebook-based evaluations.
-
-These utilities keep the notebooks aligned with the preprocessing pipeline by
-exposing a lightweight wrapper around the runtime F0 extractor.
 """
 
 from __future__ import annotations

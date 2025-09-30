@@ -206,16 +206,20 @@ class MelDataset(torch.utils.data.Dataset):
 
         if self.verbose:
             backend_names = ', '.join(self.f0_extractor.describe_backends())
-            print(f"Computing F0 for {path} using backends: {backend_names}")
+            print(f"[MelDataset] Computing F0 for {path} using backends: {backend_names}")
 
         try:
             result = self.f0_extractor.compute(waveform, sr=sr)
             f0 = result.f0
             backend_name = result.backend_name
+            if self.verbose and backend_name:
+                print(f"[MelDataset] Selected F0 backend '{backend_name}' for {path}")
         except BackendComputationError as exc:
             logger.warning("All configured F0 backends failed for %s: %s", path, exc)
             f0 = np.zeros((0,), dtype=np.float32)
             backend_name = ""
+            if self.verbose:
+                print(f"[MelDataset] F0 computation failed for {path}; using zeros")
 
         if self._cache_enabled and not self.data_augmentation:
             try:

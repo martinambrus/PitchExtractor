@@ -276,6 +276,21 @@ def _normalise_backend_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
+def _coerce_enabled_flag(value) -> bool:
+    """Interpret configuration truthy/falsey values consistently."""
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return False
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        # fall through for unexpected string values
+    return bool(value)
+
+
 class F0Extractor:
     """Facade for computing F0 with configurable backend fallbacks."""
 
@@ -307,7 +322,9 @@ class F0Extractor:
         merged_sequence: List[Dict] = []
         for raw_name in sequence:
             if isinstance(raw_name, dict):
-                merged_sequence.append(raw_name)
+                entry = dict(raw_name)
+                entry["enabled"] = _coerce_enabled_flag(entry.get("enabled", True))
+                merged_sequence.append(entry)
                 continue
             name = str(raw_name)
             backend_cfg = backends_config.get(name, {})
@@ -315,7 +332,7 @@ class F0Extractor:
             merged_entry = {**default_entry, **backend_cfg}
             merged_entry.setdefault("name", name)
             merged_entry.setdefault("type", merged_entry.get("backend", merged_entry.get("type", name)))
-            merged_entry.setdefault("enabled", True)
+            merged_entry["enabled"] = _coerce_enabled_flag(merged_entry.get("enabled", True))
             merged_sequence.append(merged_entry)
 
         self.backends: List[BaseF0Backend] = []
