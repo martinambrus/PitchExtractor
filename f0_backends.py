@@ -510,7 +510,14 @@ class ReaperBackend(BaseF0Backend):
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
-        signal = audio.astype(np.float64, copy=False)
+        signal = np.asarray(audio)
+        if not np.issubdtype(signal.dtype, np.integer):
+            # REAPER expects 16-bit PCM input.  Convert floating point audio to
+            # the required range while avoiding saturation artefacts.
+            signal = np.clip(signal, -1.0, 1.0)
+            signal = np.round(signal * 32767.0).astype(np.int16)
+        else:
+            signal = signal.astype(np.int16, copy=False)
         frame_period_sec = self.frame_period_ms / 1000.0
         times, f0, _, vuv = self._reaper.reaper(
             signal,
