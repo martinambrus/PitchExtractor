@@ -517,16 +517,34 @@ class ReaperBackend(BaseF0Backend):
             # Flatten any redundant dimensions (e.g. (N, 1)).  REAPER only
             # supports mono waveforms so we collapse to a single vector.
             signal = np.reshape(signal, -1)
-        if not np.issubdtype(signal.dtype, np.integer):
-            # REAPER expects 16-bit PCM input.  Convert floating point audio to
-            # the required range while avoiding saturation artefacts.
-            signal = np.clip(signal, -1.0, 1.0)
-            signal = np.round(signal * 32767.0).astype(np.int16)
-        else:
-            signal = signal.astype(np.int16, copy=False)
-        signal = np.ascontiguousarray(signal)
+
         if signal.size == 0:
             raise BackendComputationError("REAPER received an empty waveform")
+
+        info = np.iinfo(np.int16)
+        if np.issubdtype(signal.dtype, np.floating):
+            # Replace NaN/Inf values prior to scaling into the 16-bit PCM range
+            # expected by REAPER.
+            if not np.all(np.isfinite(signal)):
+                signal = np.nan_to_num(signal, copy=False)
+            signal = np.clip(signal, -1.0, 1.0)
+            signal = np.round(signal * info.max).astype(np.int16)
+        elif np.issubdtype(signal.dtype, np.integer):
+            if signal.dtype != np.int16:
+                signal = signal.astype(np.int64, copy=False)
+                signal = np.clip(signal, info.min, info.max).astype(np.int16)
+            else:
+                # Copy to ensure we hand pyreaper an exclusive, contiguous buffer.
+                signal = signal.copy()
+        else:
+            # Fallback for other dtypes (e.g. complex) by casting through float.
+            signal = np.asarray(signal, dtype=np.float64)
+            if not np.all(np.isfinite(signal)):
+                signal = np.nan_to_num(signal, copy=False)
+            signal = np.clip(signal, -1.0, 1.0)
+            signal = np.round(signal * info.max).astype(np.int16)
+
+        signal = np.ascontiguousarray(signal)
         frame_period_sec = self.frame_period_ms / 1000.0
         outputs = self._reaper.reaper(
             signal,
