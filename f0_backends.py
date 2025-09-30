@@ -539,7 +539,30 @@ class ReaperBackend(BaseF0Backend):
 
         f0 = np.asarray(f0, dtype=np.float64)
         vuv = np.asarray(vuv)
-        f0[vuv == 0] = 0.0
+
+        # ``pyreaper`` occasionally returns arrays of slightly different
+        # lengths (e.g. the ``vuv`` flag omitting trailing frames).  Clip both
+        # arrays to their shared length so boolean masking is always valid.
+        if f0.shape != vuv.shape:
+            vuv = np.squeeze(vuv)
+            if f0.ndim > 1:
+                f0 = np.squeeze(f0)
+            common_length = min(f0.shape[0], vuv.shape[0])
+            if common_length == 0:
+                raise BackendComputationError(
+                    "pyreaper returned empty F0 or V/UV tracks"
+                )
+            if self.verbose:
+                self.log(
+                    "REAPER output length mismatch (f0=%s, vuv=%s); clipping to %s frames"
+                    % (f0.shape, vuv.shape, common_length)
+                )
+            f0 = f0[:common_length]
+            vuv = vuv[:common_length]
+
+        mask = np.asarray(vuv, dtype=bool)
+        f0 = np.array(f0, copy=True)
+        f0[~mask] = 0.0
         return f0
 
 
