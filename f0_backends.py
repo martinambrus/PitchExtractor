@@ -333,6 +333,7 @@ class F0Extractor:
         defaults: Dict[str, Dict] = {entry["name"]: entry for entry in self.DEFAULT_SEQUENCE}
         merged_sequence: List[Dict] = []
         use_defaults_for_missing = not bool(backends_config)
+        self._skipped_backends: List[str] = []
 
         for raw_name in sequence:
             if isinstance(raw_name, dict):
@@ -341,6 +342,7 @@ class F0Extractor:
                 merged_sequence.append(entry)
                 continue
             name = str(raw_name)
+            backend_name = _normalise_backend_name(name)
             backend_cfg = backends_config.get(name)
             if backend_cfg is None and not use_defaults_for_missing:
                 # When the user provided at least one backend configuration we
@@ -348,6 +350,7 @@ class F0Extractor:
                 # disabled.  Skip them instead of resurrecting the default
                 # definition so the runtime chain mirrors the configuration.
                 LOGGER.debug("Skipping backend '%s' because it is not defined in config", name)
+                self._skipped_backends.append(f"{backend_name} (not configured)")
                 continue
 
             default_entry = defaults.get(name, {"name": name, "type": name})
@@ -358,14 +361,20 @@ class F0Extractor:
             merged_sequence.append(merged_entry)
 
         self.backends: List[BaseF0Backend] = []
+        self._backend_chain: List[str] = []
         errors: List[str] = []
         for entry in merged_sequence:
+            name = entry.get("name") or entry.get("type") or "backend"
+            backend_name = _normalise_backend_name(str(name))
             if not entry.get("enabled", True):
+                self._skipped_backends.append(f"{backend_name} (disabled)")
                 continue
-            name = entry.get("name") or entry.get("type")
             backend_type = (entry.get("type") or entry.get("backend") or "pyworld").lower()
             backend_cls = BACKEND_REGISTRY.get(backend_type)
             if backend_cls is None:
+                self._skipped_backends.append(
+                    f"{backend_name} (unknown backend type '{backend_type}')"
+                )
                 errors.append(f"Unknown backend type '{backend_type}' (entry: {name})")
                 continue
             backend_name = _normalise_backend_name(str(name))
@@ -382,12 +391,15 @@ class F0Extractor:
                 message = f"Skipping backend '{backend_name}': {exc}"
                 errors.append(message)
                 LOGGER.warning(message)
+                self._skipped_backends.append(f"{backend_name} (unavailable: {exc})")
                 continue
             except Exception as exc:  # pragma: no cover - defensive
                 errors.append(f"Failed to initialise backend '{backend_name}': {exc}")
                 LOGGER.exception("Failed to initialise backend '%s'", backend_name)
+                self._skipped_backends.append(f"{backend_name} (initialisation error: {exc})")
                 continue
             self.backends.append(instance)
+            self._backend_chain.append(instance.name)
 
         if not self.backends:
             error_message = "No usable F0 backends are configured."
@@ -448,7 +460,11 @@ class F0Extractor:
 
     # ------------------------------------------------------------------
     def describe_backends(self) -> List[str]:
-        return [backend.name for backend in self.backends]
+        return list(self._backend_chain)
+
+    # ------------------------------------------------------------------
+    def describe_skipped_backends(self) -> List[str]:
+        return list(self._skipped_backends)
 
 
 def build_f0_extractor(

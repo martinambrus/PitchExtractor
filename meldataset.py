@@ -80,8 +80,12 @@ class MelDataset(torch.utils.data.Dataset):
         self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
         self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
         if self.verbose:
-            backend_summary = ', '.join(self.f0_extractor.describe_backends())
+            active_backends = self.f0_extractor.describe_backends()
+            backend_summary = ', '.join(active_backends) if active_backends else 'none'
             print(f"[MelDataset] F0 backends in use: {backend_summary}")
+            skipped_backends = self.f0_extractor.describe_skipped_backends()
+            if skipped_backends:
+                print(f"[MelDataset] Skipped F0 backends: {', '.join(skipped_backends)}")
 
         # cache management helpers
         self._mel_cache_suffix = "_mel.npy"
@@ -205,7 +209,8 @@ class MelDataset(torch.utils.data.Dataset):
                 self._remove_file_safely(legacy_path)
 
         if self.verbose:
-            backend_names = ', '.join(self.f0_extractor.describe_backends())
+            active_backends = self.f0_extractor.describe_backends()
+            backend_names = ', '.join(active_backends) if active_backends else 'none'
             print(f"[MelDataset] Computing F0 for {path} using backends: {backend_names}")
 
         try:
