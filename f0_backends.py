@@ -147,6 +147,13 @@ class PyWorldBackend(BaseF0Backend):
 class CrepeBackend(BaseF0Backend):
     backend_type = "crepe"
 
+    # ``tensorflow`` maintains process-global GPU state.  When CUDA
+    # initialisation fails we disable GPU execution for the remainder of the
+    # process so subsequent backend instances (e.g. dataloader workers) do not
+    # repeatedly trigger the expensive failure path.
+    _GLOBAL_GPU_DISABLED: bool = False
+    _GLOBAL_DISABLE_REASON: Optional[str] = None
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         device_preference = self.config.get("device", "auto")
@@ -174,6 +181,14 @@ class CrepeBackend(BaseF0Backend):
         self._gpu_disabled = False
         if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
             self._disable_gpu("configuration requests CPU execution")
+        elif CrepeBackend._GLOBAL_GPU_DISABLED:
+            # Another instance already determined that GPU execution is not
+            # viable in this process.  Mirror that decision locally without
+            # re-importing TensorFlow or emitting duplicate logs.
+            self._gpu_disabled = True
+            if self.verbose:
+                reason = CrepeBackend._GLOBAL_DISABLE_REASON or "previous failure"
+                self.log(f"Using CPU because GPU was disabled earlier ({reason}).")
         try:
             import crepe  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional dependency
@@ -225,7 +240,13 @@ class CrepeBackend(BaseF0Backend):
                     "CREPE predict failed due to CUDA initialisation; retrying with GPU disabled."
                 )
                 self._disable_gpu("CUDA initialisation failure")
-                outputs = self._crepe.predict(waveform, sr, **kwargs)
+                try:
+                    outputs = self._crepe.predict(waveform, sr, **kwargs)
+                except Exception as cpu_exc:
+                    raise RuntimeError(
+                        "CREPE predict failed even after disabling GPU execution. "
+                        "Set 'device: cpu' in the CREPE backend configuration to skip GPU initialisation."
+                    ) from cpu_exc
             else:
                 if self._force_gpu:
                     raise RuntimeError(
@@ -271,6 +292,9 @@ class CrepeBackend(BaseF0Backend):
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Failed to disable GPU devices for CREPE: %s", exc)
             self._gpu_disabled = True
+        finally:
+            CrepeBackend._GLOBAL_GPU_DISABLED = True
+            CrepeBackend._GLOBAL_DISABLE_REASON = reason
 
     def _should_retry_on_cpu(self, exc: BaseException) -> bool:
         if self._gpu_disabled:
