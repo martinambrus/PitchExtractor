@@ -74,21 +74,29 @@ dataset_params:
           algorithm: dio
           fallback: null
           stonemask: true
-      # CREPE neural F0. ``model`` accepts "tiny", "small", "medium", or
-      # "full". ``step_size_ms`` controls the analysis hop in milliseconds.
-      # ``viterbi`` smooths the contour, and ``confidence_threshold`` zeroes
-      # frames below the specified probability. ``device`` accepts ``auto``
-      # (default heuristic), ``cpu`` to suppress TensorFlow GPU initialisation
-      # when no driver is available, or ``gpu`` to require CUDA and surface
-      # TensorFlow errors instead of falling back.
+      # TorchCrepe neural F0 (PyTorch implementation of CREPE). ``model`` accepts
+      # "tiny", "small", "medium", or "full". ``step_size_ms`` controls the
+      # analysis hop in milliseconds. ``fmin``/``fmax`` bound the search range.
+      # ``batch_size`` controls GPU memory usage, ``pad``/``pad_mode`` mirror the
+      # torchcrepe API, and ``return_periodicity`` exposes per-frame confidence
+      # scores which can be thresholded via ``periodicity_threshold``. Set
+      # ``median_filter_size`` > 1 to apply optional smoothing. ``device`` accepts
+      # ``auto`` (prefer CUDA when available) or an explicit torch device string
+      # like ``cpu`` or ``cuda:0``.
       crepe:
         type: crepe
         enabled: false
         config:
           model: full
           step_size_ms: null
-          viterbi: true
-          confidence_threshold: 0.1
+          fmin: 50.0
+          fmax: 1100.0
+          batch_size: 1024
+          pad: true
+          pad_mode: reflect
+          return_periodicity: true
+          periodicity_threshold: 0.1
+          median_filter_size: 0
           device: auto
       # RMVPE deep learning F0. ``model_path`` allows a custom checkpoint.
       # ``device`` can be "cuda" or "cpu". ``is_half`` loads the half-precision

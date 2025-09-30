@@ -16,7 +16,6 @@ another backend defined in the configuration.
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import logging
 import re
 from typing import Dict, List, Optional
@@ -147,199 +146,97 @@ class PyWorldBackend(BaseF0Backend):
 class CrepeBackend(BaseF0Backend):
     backend_type = "crepe"
 
-    # ``tensorflow`` maintains process-global GPU state.  When CUDA
-    # initialisation fails we disable GPU execution for the remainder of the
-    # process so subsequent backend instances (e.g. dataloader workers) do not
-    # repeatedly trigger the expensive failure path.
-    _GLOBAL_GPU_DISABLED: bool = False
-    _GLOBAL_DISABLE_REASON: Optional[str] = None
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        device_preference = self.config.get("device", "auto")
-        if device_preference is None:
-            device_preference = "auto"
-        self._device_preference = str(device_preference).strip().lower()
-        original_preference = self._device_preference
-        valid_preferences = {
-            "auto",
-            "cpu",
-            "cpu-only",
-            "cpu_only",
-            "gpu",
-            "cuda",
-            "gpu-only",
-            "gpu_only",
-        }
-        if self._device_preference not in valid_preferences:
-            LOGGER.warning(
-                "Unknown CREPE device preference '%s'; defaulting to 'auto'.",
-                original_preference,
-            )
-            self._device_preference = "auto"
-        self._force_gpu = self._device_preference in {"gpu", "cuda", "gpu-only", "gpu_only"}
-        self._gpu_disabled = False
-        if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
-            self._disable_gpu("configuration requests CPU execution")
-        elif CrepeBackend._GLOBAL_GPU_DISABLED:
-            # Another instance already determined that GPU execution is not
-            # viable in this process.  Mirror that decision locally without
-            # re-importing TensorFlow or emitting duplicate logs.
-            self._gpu_disabled = True
-            if self.verbose:
-                reason = CrepeBackend._GLOBAL_DISABLE_REASON or "previous failure"
-                self.log(f"Using CPU because GPU was disabled earlier ({reason}).")
         try:
-            import crepe  # type: ignore
+            import torch
+            import torchcrepe
         except ImportError as exc:  # pragma: no cover - optional dependency
-            raise BackendUnavailableError("crepe is not installed") from exc
+            raise BackendUnavailableError("torchcrepe is not installed") from exc
 
-        self._crepe = crepe
-        self._initialise_tensorflow_gpu_state()
-        self.model = self.config.get("model", "full")
-        self.viterbi = bool(self.config.get("viterbi", True))
-        self.center = bool(self.config.get("center", True))
-        self.confidence_threshold = self._coerce_float("confidence_threshold", 0.05)
-        self.step_size_ms = self._coerce_float("step_size_ms", self.frame_period_ms)
-        # Older CREPE releases used ``model_capacity`` instead of ``model`` and
-        # ``hop_length`` instead of ``step_size``.  Introspect the callable so we
-        # can adapt automatically and avoid runtime ``TypeError`` exceptions when
-        # users install a different version of the dependency.
-        signature = inspect.signature(self._crepe.predict)
-        self._predict_params = set(signature.parameters)
-        if "model" in self._predict_params:
-            self._model_kwarg = "model"
-        elif "model_capacity" in self._predict_params:
-            self._model_kwarg = "model_capacity"
+        self._torch = torch
+        self._torchcrepe = torchcrepe
+
+        device_preference = str(self.config.get("device", "auto") or "auto").strip().lower()
+        if device_preference == "auto":
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._force_gpu = False
         else:
-            self._model_kwarg = None
+            try:
+                self._device = torch.device(device_preference)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid torch device specification '{device_preference}' for CREPE backend"
+                ) from exc
+            if self._device.type == "cuda" and not torch.cuda.is_available():
+                raise BackendUnavailableError(
+                    "CUDA device requested for CREPE backend but no CUDA devices are available"
+                )
+            self._force_gpu = self._device.type == "cuda"
+
+        self.model = self.config.get("model", "full")
+        self.step_size_ms = self._coerce_float("step_size_ms", self.frame_period_ms)
+        self.fmin = self._coerce_float("fmin", 50.0)
+        self.fmax = self._coerce_float("fmax", 1100.0)
+        self.batch_size = int(self.config.get("batch_size", 1024) or 1024)
+        self.pad = bool(self.config.get("pad", True))
+        self.pad_mode = str(self.config.get("pad_mode", "reflect"))
+        self.return_periodicity = bool(self.config.get("return_periodicity", True))
+        self.periodicity_threshold = self._coerce_float("periodicity_threshold", 0.1)
+        self.use_median_filter = int(self.config.get("median_filter_size", 0) or 0)
+        if self.use_median_filter < 0:
+            raise ValueError("median_filter_size must be >= 0")
 
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
         waveform = audio.astype(np.float32, copy=False)
-        kwargs: Dict[str, object] = {}
-        if self._model_kwarg:
-            kwargs[self._model_kwarg] = self.model
-        if "step_size" in self._predict_params:
-            kwargs["step_size"] = self.step_size_ms
-        elif "hop_length" in self._predict_params:
-            hop_length = max(1, int(round(self.step_size_ms * sr / 1000.0)))
-            kwargs["hop_length"] = hop_length
-        if "center" in self._predict_params:
-            kwargs["center"] = self.center
-        if "viterbi" in self._predict_params:
-            kwargs["viterbi"] = self.viterbi
-        if "verbose" in self._predict_params:
-            kwargs["verbose"] = 0
+        if waveform.ndim != 1:
+            waveform = waveform.reshape(-1)
+        tensor = self._torch.from_numpy(waveform).unsqueeze(0).to(self._device)
+        hop_length = max(1, int(round(self.step_size_ms * sr / 1000.0)))
 
-        try:
-            outputs = self._crepe.predict(waveform, sr, **kwargs)
-        except Exception as exc:  # pragma: no cover - defensive; TensorFlow error surface varies
-            if self._should_retry_on_cpu(exc):
-                self.log(
-                    "CREPE predict failed due to CUDA initialisation; retrying with GPU disabled."
-                )
-                self._disable_gpu("CUDA initialisation failure")
-                try:
-                    outputs = self._crepe.predict(waveform, sr, **kwargs)
-                except Exception as cpu_exc:
-                    raise RuntimeError(
-                        "CREPE predict failed even after disabling GPU execution. "
-                        "Set 'device: cpu' in the CREPE backend configuration to skip GPU initialisation."
-                    ) from cpu_exc
-            else:
-                if self._force_gpu:
-                    raise RuntimeError(
-                        "CREPE GPU execution was requested (device='gpu') but TensorFlow raised an error. "
-                        "Confirm that the TensorFlow build includes GPU support and that drivers are installed."
-                    ) from exc
-                raise
-        if isinstance(outputs, tuple):
-            time = outputs[0]
-            frequency = outputs[1]
-            confidence = outputs[2] if len(outputs) > 2 else np.ones_like(frequency)
-        else:
-            frequency = np.asarray(outputs)
-            frame_period = self.step_size_ms / 1000.0
-            time = np.arange(frequency.shape[0], dtype=np.float32) * frame_period
-            confidence = np.ones_like(frequency)
-
-        f0 = frequency.astype(np.float64)
-        if self.confidence_threshold > 0 and confidence is not None:
-            f0[np.asarray(confidence) < self.confidence_threshold] = 0.0
-        mean_conf = float(np.asarray(confidence).mean()) if confidence is not None else 1.0
-        self.log(f"CREPE analysed {len(time)} frames with mean confidence {mean_conf:.3f}.")
-        return f0
-
-    def _disable_gpu(self, reason: str, tf_module=None) -> None:
-        if self._gpu_disabled:
-            return
-        try:
-            if tf_module is None:
-                import tensorflow as tf  # type: ignore
-            else:
-                tf = tf_module
-        except ImportError:  # pragma: no cover - optional dependency
-            self.log(
-                "TensorFlow not available while trying to disable CREPE GPU execution; assuming CPU-only build."
+        with self._torch.no_grad():  # pragma: no cover - heavy dependency
+            outputs = self._torchcrepe.predict(
+                tensor,
+                sr,
+                hop_length,
+                fmin=self.fmin,
+                fmax=self.fmax,
+                model=self.model,
+                batch_size=self.batch_size,
+                device=self._device,
+                pad=self.pad,
+                pad_mode=self.pad_mode,
+                return_periodicity=self.return_periodicity,
             )
-            self._gpu_disabled = True
-            return
-        try:
-            tf.config.set_visible_devices([], "GPU")
-            self.log(f"Disabled TensorFlow GPU devices for CREPE ({reason}).")
-            self._gpu_disabled = True
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Failed to disable GPU devices for CREPE: %s", exc)
-            self._gpu_disabled = True
-        finally:
-            CrepeBackend._GLOBAL_GPU_DISABLED = True
-            CrepeBackend._GLOBAL_DISABLE_REASON = reason
 
-    def _should_retry_on_cpu(self, exc: BaseException) -> bool:
-        if self._gpu_disabled:
-            return False
-        if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
-            return False
-        if self._force_gpu:
-            return False
-        return self._is_cuda_initialisation_error(exc)
-
-    def _is_cuda_initialisation_error(self, exc: BaseException) -> bool:
-        message = str(exc)
-        cuda_failure_signatures = [
-            "CUDA_ERROR_NOT_INITIALIZED",
-            "failed call to cuInit",
-            "CUDA runtime implicit initialization",
-        ]
-        return any(token in message for token in cuda_failure_signatures)
-
-    def _initialise_tensorflow_gpu_state(self):
-        if self._gpu_disabled:
-            return None
-        try:
-            import tensorflow as tf  # type: ignore
-        except ImportError:
-            return None
-        if self._force_gpu:
-            return tf
-        if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
-            return tf
-        try:
-            devices = tf.config.list_physical_devices("GPU")
-        except Exception as exc:  # pragma: no cover - defensive
-            if self._is_cuda_initialisation_error(exc):
-                self.log(
-                    "TensorFlow GPU discovery failed during CREPE initialisation; falling back to CPU."
-                )
-                self._disable_gpu("CUDA initialisation failure during backend setup", tf_module=tf)
+            if self.return_periodicity:
+                f0_tensor, periodicity = outputs
             else:
-                LOGGER.warning("Unexpected error while listing TensorFlow GPU devices: %s", exc)
-            return tf
-        if not devices:
-            self.log("TensorFlow reported no GPU devices; forcing CREPE to run on CPU.")
-            self._disable_gpu("no GPU devices detected", tf_module=tf)
-        return tf
+                f0_tensor = outputs
+                periodicity = None
+
+            if self.use_median_filter > 1:
+                f0_tensor = self._torchcrepe.filter.median(f0_tensor, self.use_median_filter)
+                if periodicity is not None:
+                    periodicity = self._torchcrepe.filter.median(periodicity, self.use_median_filter)
+
+        f0 = f0_tensor.squeeze(0).detach().cpu().numpy().astype(np.float64)
+        if periodicity is not None:
+            confidence = periodicity.squeeze(0).detach().cpu().numpy()
+        else:
+            confidence = None
+
+        if confidence is not None and self.periodicity_threshold > 0:
+            f0[confidence < self.periodicity_threshold] = 0.0
+
+        mean_conf = float(confidence.mean()) if confidence is not None else 1.0
+        self.log(
+            "CREPE analysed %d frames on %s with mean periodicity %.3f."
+            % (f0.shape[0], self._device.type, mean_conf)
+        )
+
+        return f0
 
 
 class RMVPEBackend(BaseF0Backend):
