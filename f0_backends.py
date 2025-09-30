@@ -445,8 +445,52 @@ class PraatBackend(BaseF0Backend):
             if method_enum is not None:
                 kwargs["method"] = method_enum
             pitch = sound.to_pitch(**kwargs)
-        f0 = pitch.selected_array[self.pitch_unit.lower()].astype(np.float64)
-        return f0
+        selected = pitch.selected_array
+        unit_key = self.pitch_unit or "Hertz"
+        candidate_keys: List[str] = []
+        if isinstance(unit_key, str):
+            candidate_keys.extend(
+                [
+                    unit_key,
+                    unit_key.lower(),
+                    unit_key.upper(),
+                    unit_key.capitalize(),
+                ]
+            )
+            if unit_key.lower() == "hertz":
+                candidate_keys.append("frequency")
+        else:
+            candidate_keys.extend(["Hertz", "frequency"])
+
+        # Preserve order while removing duplicates
+        seen = set()
+        candidate_keys = [key for key in candidate_keys if not (key in seen or seen.add(key))]
+
+        last_error: Optional[Exception] = None
+        for key in candidate_keys:
+            try:
+                values = selected[key]
+                return np.asarray(values, dtype=np.float64)
+            except Exception as exc:  # pragma: no cover - passthrough for unexpected APIs
+                last_error = exc
+                continue
+
+        available: List[str] = []
+        if hasattr(selected, "keys"):
+            try:
+                available = list(selected.keys())  # type: ignore[assignment]
+            except Exception:  # pragma: no cover - defensive
+                available = []
+        dtype = getattr(selected, "dtype", None)
+        if not available and getattr(dtype, "names", None):
+            available = list(dtype.names)
+
+        detail = (
+            f"Available fields: {available!r}. Last error: {last_error}" if available or last_error else ""
+        )
+        raise ValueError(
+            f"Unsupported Praat pitch unit '{self.pitch_unit}'. {detail}"
+        )
 
 
 class ReaperBackend(BaseF0Backend):
