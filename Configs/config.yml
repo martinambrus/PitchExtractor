@@ -77,7 +77,9 @@ dataset_params:
       # CREPE neural F0. ``model`` accepts "tiny", "small", "medium", or
       # "full". ``step_size_ms`` controls the analysis hop in milliseconds.
       # ``viterbi`` smooths the contour, and ``confidence_threshold`` zeroes
-      # frames below the specified probability.
+      # frames below the specified probability. ``device`` can be set to
+      # "cpu" to suppress TensorFlow GPU initialisation when no driver is
+      # available.
       crepe:
         type: crepe
         enabled: false
@@ -86,6 +88,7 @@ dataset_params:
           step_size_ms: null
           viterbi: true
           confidence_threshold: 0.1
+          device: auto
       # RMVPE deep learning F0. ``model_path`` allows a custom checkpoint.
       # ``device`` can be "cuda" or "cpu". ``is_half`` loads the half-precision
       # weights when GPU memory is constrained.

@@ -149,6 +149,13 @@ class CrepeBackend(BaseF0Backend):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        device_preference = self.config.get("device")
+        self._device_preference = (
+            str(device_preference).strip().lower() if device_preference is not None else None
+        )
+        self._gpu_disabled = False
+        if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
+            self._disable_gpu("configuration requests CPU execution")
         try:
             import crepe  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional dependency
@@ -191,7 +198,17 @@ class CrepeBackend(BaseF0Backend):
         if "verbose" in self._predict_params:
             kwargs["verbose"] = 0
 
-        outputs = self._crepe.predict(waveform, sr, **kwargs)
+        try:
+            outputs = self._crepe.predict(waveform, sr, **kwargs)
+        except RuntimeError as exc:
+            if self._should_retry_on_cpu(exc):
+                self.log(
+                    "CREPE predict failed due to CUDA initialisation; retrying with GPU disabled."
+                )
+                self._disable_gpu("CUDA initialisation failure")
+                outputs = self._crepe.predict(waveform, sr, **kwargs)
+            else:
+                raise
         if isinstance(outputs, tuple):
             time = outputs[0]
             frequency = outputs[1]
@@ -208,6 +225,38 @@ class CrepeBackend(BaseF0Backend):
         mean_conf = float(np.asarray(confidence).mean()) if confidence is not None else 1.0
         self.log(f"CREPE analysed {len(time)} frames with mean confidence {mean_conf:.3f}.")
         return f0
+
+    def _disable_gpu(self, reason: str) -> None:
+        if self._gpu_disabled:
+            return
+        try:
+            import tensorflow as tf  # type: ignore
+        except ImportError:  # pragma: no cover - optional dependency
+            self.log(
+                "TensorFlow not available while trying to disable CREPE GPU execution; assuming CPU-only build."
+            )
+            self._gpu_disabled = True
+            return
+        try:
+            tf.config.set_visible_devices([], "GPU")
+            self.log(f"Disabled TensorFlow GPU devices for CREPE ({reason}).")
+            self._gpu_disabled = True
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Failed to disable GPU devices for CREPE: %s", exc)
+            self._gpu_disabled = True
+
+    def _should_retry_on_cpu(self, exc: RuntimeError) -> bool:
+        if self._gpu_disabled:
+            return False
+        if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
+            return False
+        message = str(exc)
+        cuda_failure_signatures = [
+            "CUDA_ERROR_NOT_INITIALIZED",
+            "failed call to cuInit",
+            "CUDA runtime implicit initialization",
+        ]
+        return any(token in message for token in cuda_failure_signatures)
 
 
 class RMVPEBackend(BaseF0Backend):
