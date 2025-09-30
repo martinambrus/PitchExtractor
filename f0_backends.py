@@ -19,7 +19,7 @@ import dataclasses
 import inspect
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -615,6 +615,25 @@ def _normalise_backend_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
+def _resolve_backend_config(
+    name: str, backends_config: Dict[str, Dict]
+) -> Tuple[Optional[Dict], str]:
+    """Return a backend configuration entry using case-insensitive lookup."""
+
+    if not backends_config:
+        return None, name
+
+    if name in backends_config:
+        return backends_config[name], name
+
+    normalised = _normalise_backend_name(name)
+    for key, cfg in backends_config.items():
+        if _normalise_backend_name(key) == normalised:
+            return cfg, key
+
+    return None, name
+
+
 def _coerce_enabled_flag(value) -> bool:
     """Interpret configuration truthy/falsey values consistently."""
 
@@ -688,7 +707,7 @@ class F0Extractor:
                 continue
             name = str(raw_name)
             backend_name = _normalise_backend_name(name)
-            backend_cfg = backends_config.get(name)
+            backend_cfg, backend_cfg_key = _resolve_backend_config(name, backends_config)
             if backend_cfg is None and not use_defaults_for_missing:
                 # When the user provided at least one backend configuration we
                 # assume any names missing from ``backends`` are intentionally
@@ -698,9 +717,9 @@ class F0Extractor:
                 self._skipped_backends.append(f"{backend_name} (not configured)")
                 continue
 
-            default_entry = defaults.get(name, {"name": name, "type": name})
+            default_entry = defaults.get(backend_cfg_key, defaults.get(name, {"name": name, "type": name}))
             merged_entry = {**default_entry, **(backend_cfg or {})}
-            merged_entry.setdefault("name", name)
+            merged_entry.setdefault("name", backend_cfg_key or name)
             merged_entry.setdefault("type", merged_entry.get("backend", merged_entry.get("type", name)))
             merged_entry["enabled"] = _coerce_enabled_flag(merged_entry.get("enabled", True))
             merged_sequence.append(merged_entry)
