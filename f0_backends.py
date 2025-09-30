@@ -187,28 +187,82 @@ class CrepeBackend(BaseF0Backend):
         if self.use_median_filter < 0:
             raise ValueError("median_filter_size must be >= 0")
 
+        # Track whether we have already warned about falling back to CPU when
+        # CUDA initialisation fails inside a forked worker (e.g. PyTorch
+        # ``DataLoader`` workers on Linux use ``fork`` by default).  Torch's
+        # CUDA runtime cannot be re-initialised safely after ``fork`` so we
+        # automatically fall back to CPU execution unless the user explicitly
+        # forced GPU usage via the ``device`` configuration option.
+        self._device_fallback_reported = False
+
+    def _maybe_switch_to_cpu(self, exc: RuntimeError) -> bool:
+        """Switch the backend to CPU when CUDA cannot be initialised."""
+
+        if self._force_gpu or self._device.type != "cuda":
+            return False
+
+        message = str(exc)
+        lower_message = message.lower()
+        # We specifically guard against CUDA initialisation problems that are
+        # typically seen in forked workers.  Broadly matching on "initialisation"
+        # keeps the fallback permissive enough to recover from
+        # ``CUDA_ERROR_NOT_INITIALIZED`` while avoiding unrelated runtime
+        # errors (which should be surfaced to the caller).
+        triggers = (
+            "cannot re-initialize cuda",
+            "cuda driver",
+            "cuda initialization",
+            "initialization error",
+        )
+        if not any(trigger in lower_message for trigger in triggers):
+            return False
+
+        warning = (
+            "CUDA initialisation failed for CREPE in this worker; falling back to CPU execution."
+        )
+        if not self._device_fallback_reported:
+            self.log(warning)
+            LOGGER.warning("[%s] %s", self.name, warning)
+            self._device_fallback_reported = True
+        self._device = self._torch.device("cpu")
+        return True
+
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
         waveform = audio.astype(np.float32, copy=False)
         if waveform.ndim != 1:
             waveform = waveform.reshape(-1)
-        tensor = self._torch.from_numpy(waveform).unsqueeze(0).to(self._device)
+        base_tensor = self._torch.from_numpy(waveform).unsqueeze(0)
         hop_length = max(1, int(round(self.step_size_ms * sr / 1000.0)))
 
-        with self._torch.no_grad():  # pragma: no cover - heavy dependency
-            outputs = self._torchcrepe.predict(
-                tensor,
-                sr,
-                hop_length,
-                fmin=self.fmin,
-                fmax=self.fmax,
-                model=self.model,
-                batch_size=self.batch_size,
-                device=self._device,
-                pad=self.pad,
-                pad_mode=self.pad_mode,
-                return_periodicity=self.return_periodicity,
-            )
+        while True:
+            try:
+                tensor = base_tensor.to(self._device)
+            except RuntimeError as exc:
+                if self._maybe_switch_to_cpu(exc):
+                    continue
+                raise
+
+            try:
+                with self._torch.no_grad():  # pragma: no cover - heavy dependency
+                    outputs = self._torchcrepe.predict(
+                        tensor,
+                        sr,
+                        hop_length,
+                        fmin=self.fmin,
+                        fmax=self.fmax,
+                        model=self.model,
+                        batch_size=self.batch_size,
+                        device=self._device,
+                        pad=self.pad,
+                        pad_mode=self.pad_mode,
+                        return_periodicity=self.return_periodicity,
+                    )
+                break
+            except RuntimeError as exc:
+                if self._maybe_switch_to_cpu(exc):
+                    continue
+                raise
 
             if self.return_periodicity:
                 f0_tensor, periodicity = outputs
