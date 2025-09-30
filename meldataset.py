@@ -1,4 +1,5 @@
 #coding: utf-8
+import glob
 import os
 import os.path as osp
 import time
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 
-import pyworld as pw
+from f0_backends import BackendComputationError, build_f0_extractor
 
 import logging
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class MelDataset(torch.utils.data.Dataset):
                  data_list,
                  sr=DEFAULT_MEL_PARAMS["sample_rate"],
                  mel_params=None,
+                 f0_params=None,
                  data_augmentation=False,
                  validation=False,
                  verbose=True
@@ -64,6 +66,23 @@ class MelDataset(torch.utils.data.Dataset):
 
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**self.mel_params)
 
+        self.f0_params = f0_params or {}
+        try:
+            self.f0_extractor = build_f0_extractor(
+                sr=self.sr,
+                hop_length=self.mel_params['hop_length'],
+                config=self.f0_params,
+                verbose=self.verbose,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialise F0 extractor: {exc}") from exc
+
+        self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
+        self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
+        if self.verbose:
+            backend_summary = ', '.join(self.f0_extractor.describe_backends())
+            print(f"[MelDataset] F0 backends in use: {backend_summary}")
+
         # cache management helpers
         self._mel_cache_suffix = "_mel.npy"
         self._mel_meta_suffix = "_mel_meta.json"
@@ -76,38 +95,29 @@ class MelDataset(torch.utils.data.Dataset):
         self.mean, self.std = -4, 4
 
         # for silence detection
-        self.zero_value = -10 # what the zero value is
-        self.bad_F0 = 5 # if less than 5 frames are non-zero, it's a bad F0, try another algorithm
+        self.zero_value = float(self.f0_params.get('zero_fill_value', 0.0))
+        self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
 
     def __len__(self):
         return len(self.data_list)
 
     def path_to_mel_and_label(self, path):
         wave_tensor, wave_sr = self._load_tensor(path)
+        waveform = wave_tensor.numpy()
+        if waveform.ndim > 1:
+            waveform = np.mean(waveform, axis=1)
+        waveform = waveform.astype(np.float32)
+        if wave_sr != self.sr:
+            waveform = self._resample_waveform(waveform, wave_sr, self.sr)
+            wave_sr = self.sr
 
-        # use pyworld to get F0
-        output_file = path + "_f0.npy"
-        # check if the file exists
-        if os.path.isfile(output_file): # if exists, load it directly
-            f0 = np.load(output_file)
-        else: # if not exist, create F0 file
-            if self.verbose:
-                print('Computing F0 for ' + path + '...')
-            x = wave_tensor.numpy().astype("double")
-            frame_period = self.mel_params['hop_length'] * 1000 / self.sr
-            _f0, t = pw.harvest(x, self.sr, frame_period=frame_period)
-            if sum(_f0 != 0) < self.bad_F0: # this happens when the algorithm fails
-                _f0, t = pw.dio(x, self.sr, frame_period=frame_period) # if harvest fails, try dio
-            f0 = pw.stonemask(x, _f0, t, self.sr)
-            # save the f0 info for later use
-            np.save(output_file, f0)
-        
-        f0 = torch.from_numpy(f0).float()
+        f0 = self._load_or_compute_f0(path, waveform, wave_sr)
         
         if self.data_augmentation:
             random_scale = 0.5 + 0.5 * np.random.random()
             wave_tensor = random_scale * wave_tensor
 
+        wave_tensor = torch.from_numpy(waveform).float()
         expected_metadata = self._build_mel_metadata(wave_tensor, wave_sr)
         mel_tensor = self._load_cached_mel(path, expected_metadata)
         if mel_tensor is None:
@@ -116,7 +126,10 @@ class MelDataset(torch.utils.data.Dataset):
                 self._save_mel_cache(path, mel_tensor, expected_metadata)
         mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
         mel_length = mel_tensor.size(1)
-        
+
+        f0 = self.f0_extractor.align_length(f0, mel_length)
+        f0 = torch.from_numpy(f0).float()
+
         f0_zero = (f0 == 0)
         
         #######################################
@@ -134,7 +147,7 @@ class MelDataset(torch.utils.data.Dataset):
         
         if torch.any(torch.isnan(f0)): # failed
             f0[torch.isnan(f0)] = self.zero_value # replace nan value with 0
-        
+
         return mel_tensor, f0, is_silence
 
 
@@ -148,6 +161,85 @@ class MelDataset(torch.utils.data.Dataset):
         wave, sr = sf.read(wave_path)
         wave_tensor = torch.from_numpy(wave).float()
         return wave_tensor, sr
+
+    def _f0_cache_paths(self, path):
+        data_path = path + self.f0_cache_suffix
+        meta_path = path + self.f0_meta_suffix
+        legacy_path = path + "_f0.npy"
+        return data_path, meta_path, legacy_path
+
+    def _load_or_compute_f0(self, path, waveform, sr):
+        data_path, meta_path, legacy_path = self._f0_cache_paths(path)
+
+        # attempt to load cached F0 with metadata validation
+        if os.path.isfile(data_path):
+            metadata = None
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, 'r', encoding='utf-8') as meta_file:
+                        metadata = json.load(meta_file)
+                except (OSError, json.JSONDecodeError):
+                    self._remove_file_safely(meta_path)
+                    metadata = None
+            if metadata:
+                expected = {
+                    'cache_identifier': self.f0_extractor.cache_identifier,
+                    'sample_rate': int(self.sr),
+                    'hop_length': int(self.mel_params['hop_length']),
+                }
+                if all(metadata.get(key) == value for key, value in expected.items()):
+                    try:
+                        return np.load(data_path)
+                    except (OSError, ValueError):
+                        self._remove_file_safely(data_path)
+                else:
+                    self._remove_file_safely(data_path)
+                    self._remove_file_safely(meta_path)
+            else:
+                self._remove_file_safely(data_path)
+
+        if os.path.isfile(legacy_path):
+            try:
+                return np.load(legacy_path)
+            except (OSError, ValueError):
+                self._remove_file_safely(legacy_path)
+
+        if self.verbose:
+            backend_names = ', '.join(self.f0_extractor.describe_backends())
+            print(f"Computing F0 for {path} using backends: {backend_names}")
+
+        try:
+            result = self.f0_extractor.compute(waveform, sr=sr)
+            f0 = result.f0
+            backend_name = result.backend_name
+        except BackendComputationError as exc:
+            logger.warning("All configured F0 backends failed for %s: %s", path, exc)
+            f0 = np.zeros((0,), dtype=np.float32)
+            backend_name = ""
+
+        if self._cache_enabled and not self.data_augmentation:
+            try:
+                np.save(data_path, f0)
+                metadata = {
+                    'cache_identifier': self.f0_extractor.cache_identifier,
+                    'backend': backend_name,
+                    'sample_rate': int(self.sr),
+                    'hop_length': int(self.mel_params['hop_length']),
+                }
+                with open(meta_path, 'w', encoding='utf-8') as meta_file:
+                    json.dump(metadata, meta_file, sort_keys=True)
+            except OSError as exc:
+                logger.warning("Failed to cache F0 for %s: %s", path, exc)
+
+        return f0
+
+    @staticmethod
+    def _resample_waveform(waveform, source_sr, target_sr):
+        if source_sr == target_sr:
+            return waveform
+        tensor = torch.from_numpy(waveform).unsqueeze(0)
+        resampled = torchaudio.functional.resample(tensor, source_sr, target_sr)
+        return resampled.squeeze(0).cpu().numpy()
 
     def _build_mel_metadata(self, wave_tensor, wave_sr):
         num_samples = int(wave_tensor.shape[0]) if wave_tensor.ndim > 0 else int(wave_tensor.numel())
@@ -226,10 +318,18 @@ class MelDataset(torch.utils.data.Dataset):
 
         for audio_path in self.data_list:
             mel_cache_path, meta_cache_path = self._mel_cache_paths(audio_path)
-            f0_cache_path = audio_path + "_f0.npy"
+            f0_cache_path, f0_meta_path, legacy_path = self._f0_cache_paths(audio_path)
             self._remove_file_safely(mel_cache_path)
             self._remove_file_safely(meta_cache_path)
             self._remove_file_safely(f0_cache_path)
+            self._remove_file_safely(f0_meta_path)
+            self._remove_file_safely(legacy_path)
+            for extra_path in glob.glob(audio_path + "_f0*.npy"):
+                if extra_path not in {f0_cache_path, legacy_path}:
+                    self._remove_file_safely(extra_path)
+            for extra_meta in glob.glob(audio_path + "_f0*.json"):
+                if extra_meta != f0_meta_path:
+                    self._remove_file_safely(extra_meta)
 
     @staticmethod
     def _remove_file_safely(path):

@@ -22,4 +22,70 @@ dataset_params:
     n_fft: 1024
     n_mels: 80
     hop_length: 300
+  f0_params:
+    bad_f0_threshold: 5
+    zero_fill_value: 0.0
+    backend_order:
+      - pyworld_harvest
+      - pyworld_dio
+      - crepe
+      - rmvpe
+      - praat
+      - reaper
+      - parselmouth
+    backends:
+      pyworld_harvest:
+        type: pyworld
+        enabled: true
+        config:
+          algorithm: harvest
+          fallback: dio
+          stonemask: true
+      pyworld_dio:
+        type: pyworld
+        enabled: true
+        config:
+          algorithm: dio
+          fallback: null
+          stonemask: true
+      crepe:
+        type: crepe
+        enabled: false
+        config:
+          model: full
+          step_size_ms: null
+          viterbi: true
+          confidence_threshold: 0.1
+      rmvpe:
+        type: rmvpe
+        enabled: false
+        config:
+          model_path: null
+          device: null
+          is_half: true
+      praat:
+        type: praat
+        enabled: false
+        config:
+          method: ac
+          min_pitch: 40.0
+          max_pitch: 1100.0
+          silence_threshold: 0.03
+          voicing_threshold: 0.45
+      reaper:
+        type: reaper
+        enabled: false
+        config:
+          min_pitch: 40.0
+          max_pitch: 600.0
+          do_high_pass: true
+      parselmouth:
+        type: parselmouth
+        enabled: false
+        config:
+          method: ac
+          min_pitch: 40.0
+          max_pitch: 1100.0
+          silence_threshold: 0.03
+          voicing_threshold: 0.45
   
