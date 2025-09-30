@@ -180,6 +180,7 @@ class CrepeBackend(BaseF0Backend):
             raise BackendUnavailableError("crepe is not installed") from exc
 
         self._crepe = crepe
+        self._initialise_tensorflow_gpu_state()
         self.model = self.config.get("model", "full")
         self.viterbi = bool(self.config.get("viterbi", True))
         self.center = bool(self.config.get("center", True))
@@ -218,7 +219,7 @@ class CrepeBackend(BaseF0Backend):
 
         try:
             outputs = self._crepe.predict(waveform, sr, **kwargs)
-        except RuntimeError as exc:
+        except Exception as exc:  # pragma: no cover - defensive; TensorFlow error surface varies
             if self._should_retry_on_cpu(exc):
                 self.log(
                     "CREPE predict failed due to CUDA initialisation; retrying with GPU disabled."
@@ -249,11 +250,14 @@ class CrepeBackend(BaseF0Backend):
         self.log(f"CREPE analysed {len(time)} frames with mean confidence {mean_conf:.3f}.")
         return f0
 
-    def _disable_gpu(self, reason: str) -> None:
+    def _disable_gpu(self, reason: str, tf_module=None) -> None:
         if self._gpu_disabled:
             return
         try:
-            import tensorflow as tf  # type: ignore
+            if tf_module is None:
+                import tensorflow as tf  # type: ignore
+            else:
+                tf = tf_module
         except ImportError:  # pragma: no cover - optional dependency
             self.log(
                 "TensorFlow not available while trying to disable CREPE GPU execution; assuming CPU-only build."
@@ -268,13 +272,16 @@ class CrepeBackend(BaseF0Backend):
             LOGGER.warning("Failed to disable GPU devices for CREPE: %s", exc)
             self._gpu_disabled = True
 
-    def _should_retry_on_cpu(self, exc: RuntimeError) -> bool:
+    def _should_retry_on_cpu(self, exc: BaseException) -> bool:
         if self._gpu_disabled:
             return False
         if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
             return False
         if self._force_gpu:
             return False
+        return self._is_cuda_initialisation_error(exc)
+
+    def _is_cuda_initialisation_error(self, exc: BaseException) -> bool:
         message = str(exc)
         cuda_failure_signatures = [
             "CUDA_ERROR_NOT_INITIALIZED",
@@ -282,6 +289,33 @@ class CrepeBackend(BaseF0Backend):
             "CUDA runtime implicit initialization",
         ]
         return any(token in message for token in cuda_failure_signatures)
+
+    def _initialise_tensorflow_gpu_state(self):
+        if self._gpu_disabled:
+            return None
+        try:
+            import tensorflow as tf  # type: ignore
+        except ImportError:
+            return None
+        if self._force_gpu:
+            return tf
+        if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
+            return tf
+        try:
+            devices = tf.config.list_physical_devices("GPU")
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._is_cuda_initialisation_error(exc):
+                self.log(
+                    "TensorFlow GPU discovery failed during CREPE initialisation; falling back to CPU."
+                )
+                self._disable_gpu("CUDA initialisation failure during backend setup", tf_module=tf)
+            else:
+                LOGGER.warning("Unexpected error while listing TensorFlow GPU devices: %s", exc)
+            return tf
+        if not devices:
+            self.log("TensorFlow reported no GPU devices; forcing CREPE to run on CPU.")
+            self._disable_gpu("no GPU devices detected", tf_module=tf)
+        return tf
 
 
 class RMVPEBackend(BaseF0Backend):
