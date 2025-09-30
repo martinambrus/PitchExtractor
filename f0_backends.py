@@ -493,109 +493,6 @@ class PraatBackend(BaseF0Backend):
         )
 
 
-class ReaperBackend(BaseF0Backend):
-    backend_type = "reaper"
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        try:
-            import pyreaper  # type: ignore
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise BackendUnavailableError("pyreaper is not installed") from exc
-
-        self._reaper = pyreaper
-        self.min_f0 = self._coerce_float("min_pitch", 40.0)
-        self.max_f0 = self._coerce_float("max_pitch", 600.0)
-        self.do_high_pass = bool(self.config.get("do_high_pass", True))
-
-    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
-        sr = int(sr or self.sample_rate)
-        signal = np.asarray(audio)
-        if signal.ndim == 0:
-            raise BackendComputationError("REAPER received a scalar input waveform")
-        if signal.ndim > 1:
-            # Flatten any redundant dimensions (e.g. (N, 1)).  REAPER only
-            # supports mono waveforms so we collapse to a single vector.
-            signal = np.reshape(signal, -1)
-
-        if signal.size == 0:
-            raise BackendComputationError("REAPER received an empty waveform")
-
-        info = np.iinfo(np.int16)
-        if np.issubdtype(signal.dtype, np.floating):
-            # Replace NaN/Inf values prior to scaling into the 16-bit PCM range
-            # expected by REAPER.
-            if not np.all(np.isfinite(signal)):
-                signal = np.nan_to_num(signal, copy=False)
-            signal = np.clip(signal, -1.0, 1.0)
-            signal = np.round(signal * info.max).astype(np.int16, copy=False)
-        elif np.issubdtype(signal.dtype, np.integer):
-            if signal.dtype != np.int16:
-                signal = signal.astype(np.int64, copy=False)
-                signal = np.clip(signal, info.min, info.max).astype(np.int16, copy=False)
-        else:
-            # Fallback for other dtypes (e.g. complex) by casting through float.
-            signal = np.asarray(signal, dtype=np.float64)
-            if not np.all(np.isfinite(signal)):
-                signal = np.nan_to_num(signal, copy=False)
-            signal = np.clip(signal, -1.0, 1.0)
-            signal = np.round(signal * info.max).astype(np.int16, copy=False)
-
-        # ``pyreaper`` interacts with the raw memory buffer supplied by NumPy.
-        # Ensure the array owns its data, is C-contiguous, and remains writable
-        # to avoid pyreaper mutating or freeing a shared view which would
-        # otherwise trigger heap corruption (observed as "malloc(): corrupted"
-        # errors when REAPER attempts to invert the signal).
-        signal = np.require(signal, dtype=np.int16, requirements=("C", "W", "O"))
-
-        frame_period_sec = self.frame_period_ms / 1000.0
-        outputs = self._reaper.reaper(
-            signal,
-            sr,
-            minf0=self.min_f0,
-            maxf0=self.max_f0,
-            frame_period=frame_period_sec,
-            do_high_pass=self.do_high_pass,
-        )
-
-        try:
-            times, f0, _, vuv = outputs
-        except ValueError:
-            if len(outputs) < 4:
-                raise
-            times = outputs[0]
-            f0 = outputs[1]
-            vuv = outputs[3]
-
-        f0 = np.asarray(f0, dtype=np.float64)
-        vuv = np.asarray(vuv)
-
-        # ``pyreaper`` occasionally returns arrays of slightly different
-        # lengths (e.g. the ``vuv`` flag omitting trailing frames).  Clip both
-        # arrays to their shared length so boolean masking is always valid.
-        if f0.shape != vuv.shape:
-            vuv = np.squeeze(vuv)
-            if f0.ndim > 1:
-                f0 = np.squeeze(f0)
-            common_length = min(f0.shape[0], vuv.shape[0])
-            if common_length == 0:
-                raise BackendComputationError(
-                    "pyreaper returned empty F0 or V/UV tracks"
-                )
-            if self.verbose:
-                self.log(
-                    "REAPER output length mismatch (f0=%s, vuv=%s); clipping to %s frames"
-                    % (f0.shape, vuv.shape, common_length)
-                )
-            f0 = f0[:common_length]
-            vuv = vuv[:common_length]
-
-        mask = np.asarray(vuv, dtype=bool)
-        f0 = np.array(f0, copy=True)
-        f0[~mask] = 0.0
-        return f0
-
-
 class ParselmouthBackend(PraatBackend):
     """Alias backend for clarity when users explicitly select 'parselmouth'."""
 
@@ -606,7 +503,6 @@ BACKEND_REGISTRY = {
     "pyworld": PyWorldBackend,
     "crepe": CrepeBackend,
     "praat": PraatBackend,
-    "reaper": ReaperBackend,
     "parselmouth": ParselmouthBackend,
 }
 

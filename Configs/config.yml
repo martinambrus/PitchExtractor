@@ -51,9 +51,6 @@ dataset_params:
       # parselmouth bindings. The ``method`` parameter accepts values like
       # "ac" (autocorrelation) or "cc" (cross-correlation).
       - praat
-      # REAPER is robust for speech with glottal closures and exposes simple
-      # minimum/maximum pitch bounds plus an optional high-pass filter.
-      - reaper
       # Native parselmouth backend mirroring Praat's algorithm selection.
       - parselmouth
     backends:
@@ -116,16 +113,6 @@ dataset_params:
           max_pitch: 1100.0
           silence_threshold: 0.03
           voicing_threshold: 0.45
-      # REAPER backend. Adjust the pitch bounds for your dataset and toggle the
-      # optional ``do_high_pass`` filter when dealing with very low-frequency
-      # noise.
-      reaper:
-        type: reaper
-        enabled: false
-        config:
-          min_pitch: 40.0
-          max_pitch: 600.0
-          do_high_pass: true
       # Native parselmouth wrapper. Accepts the same ``method``/threshold
       # options as Praat but can be configured independently if you want a
       # different parameter set.
