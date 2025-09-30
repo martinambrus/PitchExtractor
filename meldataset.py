@@ -106,6 +106,40 @@ class MelDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.data_list)
 
+    # ------------------------------------------------------------------
+    # Multiprocessing support helpers
+    def __getstate__(self):
+        """Make the dataset picklable for multiprocessing workers."""
+
+        state = self.__dict__.copy()
+        state['_f0_extractor_init'] = {
+            'sr': self.sr,
+            'hop_length': self.mel_params['hop_length'],
+            'config': self.f0_params,
+            'verbose': self.verbose,
+        }
+        # ``torchaudio`` transforms and backend instances hold module
+        # references that cannot be pickled.  Drop them here and rebuild in
+        # ``__setstate__`` when the worker process deserialises the dataset.
+        state.pop('f0_extractor', None)
+        state.pop('to_melspec', None)
+        return state
+
+    def __setstate__(self, state):
+        extractor_init = state.pop('_f0_extractor_init')
+        self.__dict__.update(state)
+        self.to_melspec = torchaudio.transforms.MelSpectrogram(**self.mel_params)
+        self.f0_extractor = build_f0_extractor(
+            sr=extractor_init['sr'],
+            hop_length=extractor_init['hop_length'],
+            config=extractor_init['config'],
+            verbose=extractor_init['verbose'],
+        )
+        self.requires_cuda_backend = getattr(self.f0_extractor, 'requires_cuda', False)
+        self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
+        self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
+        self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
+
     def path_to_mel_and_label(self, path):
         wave_tensor, wave_sr = self._load_tensor(path)
         waveform = wave_tensor.numpy()
