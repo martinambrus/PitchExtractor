@@ -511,6 +511,12 @@ class ReaperBackend(BaseF0Backend):
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
         sr = int(sr or self.sample_rate)
         signal = np.asarray(audio)
+        if signal.ndim == 0:
+            raise BackendComputationError("REAPER received a scalar input waveform")
+        if signal.ndim > 1:
+            # Flatten any redundant dimensions (e.g. (N, 1)).  REAPER only
+            # supports mono waveforms so we collapse to a single vector.
+            signal = np.reshape(signal, -1)
         if not np.issubdtype(signal.dtype, np.integer):
             # REAPER expects 16-bit PCM input.  Convert floating point audio to
             # the required range while avoiding saturation artefacts.
@@ -518,6 +524,9 @@ class ReaperBackend(BaseF0Backend):
             signal = np.round(signal * 32767.0).astype(np.int16)
         else:
             signal = signal.astype(np.int16, copy=False)
+        signal = np.ascontiguousarray(signal)
+        if signal.size == 0:
+            raise BackendComputationError("REAPER received an empty waveform")
         frame_period_sec = self.frame_period_ms / 1000.0
         outputs = self._reaper.reaper(
             signal,
