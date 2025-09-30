@@ -349,36 +349,6 @@ class CrepeBackend(BaseF0Backend):
         return f0
 
 
-class RMVPEBackend(BaseF0Backend):
-    backend_type = "rmvpe"
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        try:
-            import torch
-            from rmvpe import RMVPE  # type: ignore
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise BackendUnavailableError("rmvpe is not installed") from exc
-
-        self._torch = torch
-        device = self.config.get("device")
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        model_path = self.config.get("model_path")
-        is_half = bool(self.config.get("is_half", device == "cuda"))
-        self._model = RMVPE(model_path, is_half=is_half, device=device) if model_path else RMVPE(is_half=is_half, device=device)
-        self._model.eval()
-        self.requires_cuda = str(device).startswith("cuda")
-
-    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
-        sr = int(sr or self.sample_rate)
-        waveform = audio.astype(np.float32, copy=False)
-        tensor = self._torch.from_numpy(waveform).unsqueeze(0)
-        with self._torch.no_grad():  # pragma: no cover - heavy dependency
-            f0 = self._model.infer_from_audio(tensor, sr)
-        return f0.squeeze(0).cpu().numpy().astype(np.float64)
-
-
 class PraatBackend(BaseF0Backend):
     backend_type = "praat"
 
@@ -455,7 +425,6 @@ class ParselmouthBackend(PraatBackend):
 BACKEND_REGISTRY = {
     "pyworld": PyWorldBackend,
     "crepe": CrepeBackend,
-    "rmvpe": RMVPEBackend,
     "praat": PraatBackend,
     "reaper": ReaperBackend,
     "parselmouth": ParselmouthBackend,

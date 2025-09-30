@@ -47,10 +47,6 @@ dataset_params:
       # and noisy material. Enable it when you have the dependency installed and
       # want a data-driven approach.
       - crepe
-      # RMVPE is a deep learning based tracker that provides high accuracy at
-      # the cost of GPU resources. Configure ``device`` to "cuda" or "cpu" and
-      # optionally supply a custom model checkpoint path.
-      - rmvpe
       # Praat accesses the classic signal-processing F0 algorithms via the
       # parselmouth bindings. The ``method`` parameter accepts values like
       # "ac" (autocorrelation) or "cc" (cross-correlation).
@@ -106,16 +102,6 @@ dataset_params:
           periodicity_threshold: 0.1
           median_filter_size: 0
           device: auto
-      # RMVPE deep learning F0. ``model_path`` allows a custom checkpoint.
-      # ``device`` can be "cuda" or "cpu". ``is_half`` loads the half-precision
-      # weights when GPU memory is constrained.
-      rmvpe:
-        type: rmvpe
-        enabled: false
-        config:
-          model_path: null
-          device: null
-          is_half: true
       # Praat backend via parselmouth. ``method`` matches Praat's choices such
       # as "ac" (autocorrelation) or "cc" (cross-correlation). ``min_pitch`` and
       # ``max_pitch`` set the allowed frequency range in Hertz. The

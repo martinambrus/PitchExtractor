@@ -17,7 +17,6 @@ pip install SoundFile torchaudio torch pyyaml click matplotlib librosa pyworld
    | Backend        | Installation command / notes |
    | -------------- | ----------------------------- |
    | TorchCrepe     | `pip install torchcrepe` |
-   | RMVPE          | Follow the [RMVPE project](https://github.com/RVC-Project/RMVPE) instructions (no PyPI release as of writing). |
    | Praat / Parselmouth | `pip install praat-parselmouth` |
    | REAPER         | `pip install pyreaper` (requires a C++ build toolchain) |
 
@@ -37,15 +36,14 @@ Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up trainin
 Since both `harvest` and `dio` are relatively slow, we do have to save the computed F0 ground truth for later use. In [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py#L77-L89), it will write the computed F0 curve `_f0.npy` for each `.wav` file. This requires write permission in your data folder. 
 
 ### F0 Computation Details
-`meldataset.MelDataset` now supports a cascade of runtime-selectable F0 backends. The default configuration uses PyWorld's `harvest` followed by `dio`, mirroring the original behaviour, but you can enable neural or classical trackers such as TorchCrepe (PyTorch CREPE), RMVPE, Praat/Parselmouth, and REAPER by editing `dataset_params.f0_params` in [Configs/config.yml](Configs/config.yml). Backends are evaluated in the order defined by `backend_order`, and each backend may be toggled on/off or customised individually (for example, to adjust TorchCrepe's model size or Praat's pitch range).
+`meldataset.MelDataset` now supports a cascade of runtime-selectable F0 backends. The default configuration uses PyWorld's `harvest` followed by `dio`, mirroring the original behaviour, but you can enable neural or classical trackers such as TorchCrepe (PyTorch CREPE), Praat/Parselmouth, and REAPER by editing `dataset_params.f0_params` in [Configs/config.yml](Configs/config.yml). Backends are evaluated in the order defined by `backend_order`, and each backend may be toggled on/off or customised individually (for example, to adjust TorchCrepe's model size or Praat's pitch range).
 
 Whenever the backend configuration changes the dataset automatically regenerates cached pitch files under backend-specific filenames and stores a small JSON metadata file alongside each cache to keep track of the extractor that produced it. Failed extraction attempts fall back to the next enabled backend until a valid contour with sufficient voiced frames is produced. If all backends fail the sample is logged and the stored F0 is left empty (zeros after post-processing), so you may want to audit those cases if they occur frequently.
 
 #### Backend configuration summary
 
 - **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.
-- **TorchCrepe (CREPE)** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, constrain the search range via `fmin`/`fmax`, and tune batching (`batch_size`), padding, and optional `median_filter_size`. Enable `return_periodicity` to obtain confidence scores and zero out low-confidence frames with `periodicity_threshold`. `device` accepts `auto` (prefer CUDA) or an explicit torch device string such as `cpu`, `cuda`, or `cuda:1`. When any enabled backend requests CUDA the dataloader automatically switches to the `spawn` multiprocessing context so TorchCrepe/RMVPE can initialise GPUs inside worker processes; override this behaviour via `dataset_params.dataloader.start_method` if necessary.
-- **RMVPE** – Provide `model_path` for custom checkpoints, select the execution `device`, and enable `is_half` to use the half-precision weights when running on CUDA.
+- **TorchCrepe (CREPE)** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, constrain the search range via `fmin`/`fmax`, and tune batching (`batch_size`), padding, and optional `median_filter_size`. Enable `return_periodicity` to obtain confidence scores and zero out low-confidence frames with `periodicity_threshold`. `device` accepts `auto` (prefer CUDA) or an explicit torch device string such as `cpu`, `cuda`, or `cuda:1`. When any enabled backend requests CUDA the dataloader automatically switches to the `spawn` multiprocessing context so TorchCrepe can initialise GPUs inside worker processes; override this behaviour via `dataset_params.dataloader.start_method` if necessary.
 - **Praat / Parselmouth** – Set the `method` (e.g., `ac`, `cc`), `min_pitch`/`max_pitch` bounds, and adjust `silence_threshold` and `voicing_threshold` for sensitivity.
 - **REAPER** – Limit the search range with `min_pitch`/`max_pitch` and toggle `do_high_pass` to suppress low-frequency noise before analysis.
 
