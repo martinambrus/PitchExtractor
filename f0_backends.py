@@ -149,10 +149,28 @@ class CrepeBackend(BaseF0Backend):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        device_preference = self.config.get("device")
-        self._device_preference = (
-            str(device_preference).strip().lower() if device_preference is not None else None
-        )
+        device_preference = self.config.get("device", "auto")
+        if device_preference is None:
+            device_preference = "auto"
+        self._device_preference = str(device_preference).strip().lower()
+        original_preference = self._device_preference
+        valid_preferences = {
+            "auto",
+            "cpu",
+            "cpu-only",
+            "cpu_only",
+            "gpu",
+            "cuda",
+            "gpu-only",
+            "gpu_only",
+        }
+        if self._device_preference not in valid_preferences:
+            LOGGER.warning(
+                "Unknown CREPE device preference '%s'; defaulting to 'auto'.",
+                original_preference,
+            )
+            self._device_preference = "auto"
+        self._force_gpu = self._device_preference in {"gpu", "cuda", "gpu-only", "gpu_only"}
         self._gpu_disabled = False
         if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
             self._disable_gpu("configuration requests CPU execution")
@@ -208,6 +226,11 @@ class CrepeBackend(BaseF0Backend):
                 self._disable_gpu("CUDA initialisation failure")
                 outputs = self._crepe.predict(waveform, sr, **kwargs)
             else:
+                if self._force_gpu:
+                    raise RuntimeError(
+                        "CREPE GPU execution was requested (device='gpu') but TensorFlow raised an error. "
+                        "Confirm that the TensorFlow build includes GPU support and that drivers are installed."
+                    ) from exc
                 raise
         if isinstance(outputs, tuple):
             time = outputs[0]
@@ -249,6 +272,8 @@ class CrepeBackend(BaseF0Backend):
         if self._gpu_disabled:
             return False
         if self._device_preference in {"cpu", "cpu-only", "cpu_only"}:
+            return False
+        if self._force_gpu:
             return False
         message = str(exc)
         cuda_failure_signatures = [

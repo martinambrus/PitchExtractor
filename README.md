@@ -33,7 +33,7 @@ Whenever the backend configuration changes the dataset automatically regenerates
 #### Backend configuration summary
 
 - **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.
-- **CREPE** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, toggle `viterbi` smoothing, set a `confidence_threshold` to zero low-confidence frames, and force CPU execution via `device: cpu` when CUDA drivers are unavailable.
+- **CREPE** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, toggle `viterbi` smoothing, set a `confidence_threshold` to zero low-confidence frames, and control TensorFlow placement with `device: auto` (default heuristic), `cpu` (always run on CPU), or `gpu` (require CUDA and surface initialisation errors).
 - **RMVPE** – Provide `model_path` for custom checkpoints, select the execution `device`, and enable `is_half` to use the half-precision weights when running on CUDA.
 - **Praat / Parselmouth** – Set the `method` (e.g., `ac`, `cc`), `min_pitch`/`max_pitch` bounds, and adjust `silence_threshold` and `voicing_threshold` for sensitivity.
 - **REAPER** – Limit the search range with `min_pitch`/`max_pitch` and toggle `do_high_pass` to suppress low-frequency noise before analysis.

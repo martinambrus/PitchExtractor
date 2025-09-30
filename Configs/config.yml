@@ -77,9 +77,10 @@ dataset_params:
       # CREPE neural F0. ``model`` accepts "tiny", "small", "medium", or
       # "full". ``step_size_ms`` controls the analysis hop in milliseconds.
       # ``viterbi`` smooths the contour, and ``confidence_threshold`` zeroes
-      # frames below the specified probability. ``device`` can be set to
-      # "cpu" to suppress TensorFlow GPU initialisation when no driver is
-      # available.
+      # frames below the specified probability. ``device`` accepts ``auto``
+      # (default heuristic), ``cpu`` to suppress TensorFlow GPU initialisation
+      # when no driver is available, or ``gpu`` to require CUDA and surface
+      # TensorFlow errors instead of falling back.
       crepe:
         type: crepe
         enabled: false
