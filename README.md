@@ -10,7 +10,7 @@ cd PitchExtractor
 ```
 3. Install python requirements: 
 ```bash
-pip install SoundFile torchaudio torch pyyaml click matplotlib librosa pyworld resampy
+pip install SoundFile torchaudio torch pyyaml click matplotlib librosa pyworld resampy torchcrepe tensorflow
 ```
 4. (Optional) Install extra dependencies for alternative F0 backends:
 
