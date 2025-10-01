@@ -8,6 +8,7 @@ import random
 import json
 import numpy as np
 import soundfile as sf
+from soundfile import LibsndfileError
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -105,6 +106,7 @@ class MelDataset(torch.utils.data.Dataset):
 
         # cache audio metadata to support lazy waveform loading
         self._audio_metadata_cache = {}
+        self._invalid_paths = set()
 
         self.mean, self.std = -4, 4
         self.data_augmentation = data_augmentation and (not validation)
@@ -247,22 +249,54 @@ class MelDataset(torch.utils.data.Dataset):
         if self.synthetic_enabled and idx >= self._base_length:
             return self._generate_synthetic_sample()
 
-        data = self.data_list[idx]
-        mel_tensor, f0, is_silence = self.path_to_mel_and_label(data)
-        return mel_tensor, f0, is_silence
+        total_items = len(self.data_list)
+        if total_items == 0:
+            raise IndexError("MelDataset is empty")
+
+        attempts = 0
+        while attempts < total_items:
+            data_index = (idx + attempts) % total_items
+            data = self.data_list[data_index]
+
+            if data in self._invalid_paths:
+                attempts += 1
+                continue
+
+            try:
+                mel_tensor, f0, is_silence = self.path_to_mel_and_label(data)
+            except (FileNotFoundError, LibsndfileError, RuntimeError, OSError, ValueError) as exc:
+                self._mark_path_invalid(data, exc)
+                attempts += 1
+                continue
+
+            return mel_tensor, f0, is_silence
+
+        raise RuntimeError("No valid audio files could be loaded from the dataset")
+
+    def _mark_path_invalid(self, path, exc):
+        if path in self._invalid_paths:
+            return
+        self._invalid_paths.add(path)
+        message = f"[MelDataset] Skipping unreadable audio file: {path} ({exc})"
+        logger.warning(message)
+        if self.verbose:
+            print(message)
 
     def _load_tensor(self, data, start_frame=None, num_frames=None):
         wave_path = data
-        if start_frame is None and num_frames is None:
-            wave, sr = sf.read(wave_path, dtype='float32')
-        else:
-            start = int(start_frame or 0)
-            frames = -1 if num_frames is None else int(num_frames)
-            with sf.SoundFile(wave_path, mode='r') as sound_file:
-                sr = sound_file.samplerate
-                if start:
-                    sound_file.seek(start)
-                wave = sound_file.read(frames=frames, dtype='float32', always_2d=False)
+        try:
+            if start_frame is None and num_frames is None:
+                wave, sr = sf.read(wave_path, dtype='float32')
+            else:
+                start = int(start_frame or 0)
+                frames = -1 if num_frames is None else int(num_frames)
+                with sf.SoundFile(wave_path, mode='r') as sound_file:
+                    sr = sound_file.samplerate
+                    if start:
+                        sound_file.seek(start)
+                    wave = sound_file.read(frames=frames, dtype='float32', always_2d=False)
+        except (FileNotFoundError, LibsndfileError, RuntimeError, OSError, ValueError) as exc:
+            raise RuntimeError(f"Failed to load audio file '{wave_path}': {exc}") from exc
         wave_tensor = torch.from_numpy(np.asarray(wave, dtype=np.float32)).float()
         return wave_tensor, sr
 
@@ -408,8 +442,18 @@ class MelDataset(torch.utils.data.Dataset):
         res_type = cfg.get('resample_type', 'kaiser_best')
 
         for attempt in range(max_attempts):
-            base_path = random.choice(self.data_list)
-            wave_tensor, wave_sr = self._load_tensor(base_path)
+            available_paths = [p for p in self.data_list if p not in self._invalid_paths]
+            if not available_paths:
+                if force and attempt == max_attempts - 1:
+                    raise RuntimeError("No valid audio files available for pitch shifting")
+                return None
+
+            base_path = random.choice(available_paths)
+            try:
+                wave_tensor, wave_sr = self._load_tensor(base_path)
+            except RuntimeError as exc:
+                self._mark_path_invalid(base_path, exc)
+                continue
             waveform = wave_tensor.numpy()
             if waveform.ndim > 1:
                 waveform = np.mean(waveform, axis=-1)
