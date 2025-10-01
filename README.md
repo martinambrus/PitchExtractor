@@ -33,7 +33,7 @@ Please specify the training and validation data in `config.yml` file. The data l
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take.
 
 ### Sequence modelling options
-The default configuration now employs a Transformer encoder on top of the convolutional stack to provide stronger long-term temporal context and reduce octave jumps. You can switch between a deeper bidirectional LSTM and the Transformer backend by editing `model_params.sequence_model` in [Configs/config.yml](Configs/config.yml). The section exposes typical hyper-parameters (number of layers, attention heads, feed-forward width, etc.) so you can tailor the temporal model to your dataset.
+The default configuration now employs a hybrid temporal stack: a deep bidirectional LSTM feeds into multi-layer self-attention to capture both fine-grained temporal detail and longer-range dependencies. You can still switch between a pure bidirectional LSTM, the standalone Transformer encoder, or the hybrid model by editing `model_params.sequence_model` in [Configs/config.yml](Configs/config.yml). The section exposes typical hyper-parameters (number of recurrent layers, attention heads, feed-forward width, etc.) so you can tailor the temporal model to your dataset.
 
 ### IMPORTANT: DATA FOLDER NEEDS WRITE PERMISSION
 Since both `harvest` and `dio` are relatively slow, we do have to save the computed F0 ground truth for later use. In [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py#L77-L89), it will write the computed F0 curve `_f0.npy` for each `.wav` file. This requires write permission in your data folder.

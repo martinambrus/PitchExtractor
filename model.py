@@ -194,7 +194,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class SequenceModel(nn.Module):
-    """Flexible temporal modeling block supporting BiLSTM and Transformer backends."""
+    """Flexible temporal modeling block supporting BiLSTM, Transformer, and hybrid stacks."""
 
     def __init__(
         self,
@@ -207,6 +207,7 @@ class SequenceModel(nn.Module):
         nhead: int = 8,
         dim_feedforward: int = 1024,
         max_len: int = 2000,
+        attention_layers: int = 2,
     ):
         super().__init__()
         self.model_type = model_type.lower()
@@ -226,6 +227,30 @@ class SequenceModel(nn.Module):
                 bidirectional=bidirectional,
             )
             self._output_dim = hidden_size * (2 if bidirectional else 1)
+        elif self.model_type == "hybrid":
+            lstm_dropout = dropout if num_layers > 1 else 0.0
+            self.lstm = nn.LSTM(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=lstm_dropout,
+                batch_first=True,
+                bidirectional=bidirectional,
+            )
+            self._output_dim = hidden_size * (2 if bidirectional else 1)
+            if attention_layers < 1:
+                raise ValueError("attention_layers must be >= 1 for hybrid sequence models")
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=self._output_dim,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.attention_stack = nn.TransformerEncoder(encoder_layer, num_layers=attention_layers)
+            self.layer_norm = nn.LayerNorm(self._output_dim)
+            self.attention_input_dropout = nn.Dropout(dropout)
         elif self.model_type == "transformer":
             self.pos_encoding = SinusoidalPositionalEncoding(input_size, max_len=max_len)
             encoder_layer = nn.TransformerEncoderLayer(
@@ -250,6 +275,11 @@ class SequenceModel(nn.Module):
         if self.model_type == "bilstm":
             x, _ = self.model(x)
             return x
+        if self.model_type == "hybrid":
+            x, _ = self.lstm(x)
+            x = self.attention_input_dropout(x)
+            x = self.attention_stack(x)
+            return self.layer_norm(x)
         if self.model_type == "transformer":
             x = self.layer_norm(self.pos_encoding(x))
             return self.model(x)
