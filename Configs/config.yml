@@ -10,13 +10,13 @@ num_workers: 16
 
 training:
   mixed_precision: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
 
 model_params:
   num_class: 1
   sequence_model:
-    model_type: transformer
+    model_type: bilstm
     num_layers: 4
     dropout: 0.1
     nhead: 8
@@ -80,7 +80,7 @@ dataset_params:
       # pass after the main extraction.
       pyworld_harvest:
         type: pyworld
-        enabled: true
+        enabled: false
         config:
           algorithm: harvest
           fallback: dio
@@ -89,7 +89,7 @@ dataset_params:
       # (or null to disable) and toggle ``stonemask`` for optional refinement.
       pyworld_dio:
         type: pyworld
-        enabled: true
+        enabled: false
         config:
           algorithm: dio
           fallback: null
@@ -111,11 +111,11 @@ dataset_params:
           step_size_ms: null
           fmin: 50.0
           fmax: 1100.0
-          batch_size: 1024
+          batch_size: 12
           pad: true
           pad_mode: reflect
           return_periodicity: true
-          periodicity_threshold: 0.1
+          periodicity_threshold: 0.4
           median_filter_size: 0
           device: auto
       # SwiftF0 uses an STFT front-end with learnable filterbanks followed by a
@@ -123,7 +123,7 @@ dataset_params:
       # confidence threshold and frequency range to suppress noisy detections.
       swiftf0:
         type: swiftf0
-        enabled: false
+        enabled: true
         config:
           confidence_threshold: 0.9
           fmin: 60.0
@@ -157,7 +157,7 @@ dataset_params:
           silence_threshold: 0.03
           voicing_threshold: 0.45
   synthetic_data:
-    enabled: false
+    enabled: true
     ratio: 0.25
     apply_to_validation: false
     pitch_shift:
@@ -167,7 +167,7 @@ dataset_params:
       min_voiced_fraction: 0.05
       resample_type: kaiser_best
     world_vocoder:
-      enabled: false
+      enabled: true
       duration:
         min: 0.6
         max: 1.5
