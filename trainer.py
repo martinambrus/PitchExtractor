@@ -5,6 +5,7 @@ import os.path as osp
 import sys
 import time
 from collections import defaultdict
+import inspect
 
 import numpy as np
 import torch
@@ -61,7 +62,25 @@ class Trainer(object):
         device_type = torch.device(self.device).type if isinstance(self.device, (str, torch.device)) else "cpu"
         self.use_amp = bool(use_mixed_precision and device_type == "cuda")
         if TorchGradScaler is not None:
-            self.scaler = TorchGradScaler(device_type=device_type, enabled=self.use_amp)
+            scaler_kwargs = {"enabled": self.use_amp}
+            try:
+                signature = inspect.signature(TorchGradScaler.__init__)
+            except (TypeError, ValueError):
+                signature = None
+
+            if signature is not None:
+                parameters = signature.parameters
+                if "device_type" in parameters:
+                    scaler_kwargs["device_type"] = device_type
+                elif "device" in parameters:
+                    scaler_kwargs["device"] = device_type
+
+            try:
+                self.scaler = TorchGradScaler(**scaler_kwargs)
+            except TypeError:
+                scaler_kwargs.pop("device_type", None)
+                scaler_kwargs.pop("device", None)
+                self.scaler = TorchGradScaler(**scaler_kwargs)
             if self.use_amp:
                 self.logger.info("Using mixed precision scaling with torch.amp.GradScaler")
         else:
