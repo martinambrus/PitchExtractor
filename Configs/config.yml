@@ -9,6 +9,7 @@ val_data: "Data/val_list.txt"
 num_workers: 16
 
 model_params:
+  architecture: rmvpe
   num_class: 1
   sequence_model:
     model_type: transformer
@@ -17,6 +18,15 @@ model_params:
     nhead: 8
     dim_feedforward: 1536
     max_len: 2048
+  rmvpe_params:
+    base_channels: 64
+    branch_channels: 64
+    branch_dilations: [1, 2, 4]
+    branch_time_kernel_sizes: [3, 5, 9]
+    freq_kernel_size: 5
+    dropout: 0.1
+    harmonic_head_hidden: 128
+    energy_head_hidden: 128
 
 
 optimizer_params:

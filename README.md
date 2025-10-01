@@ -35,6 +35,9 @@ Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up trainin
 ### Sequence modelling options
 The default configuration now employs a Transformer encoder on top of the convolutional stack to provide stronger long-term temporal context and reduce octave jumps. You can switch between a deeper bidirectional LSTM and the Transformer backend by editing `model_params.sequence_model` in [Configs/config.yml](Configs/config.yml). The section exposes typical hyper-parameters (number of layers, attention heads, feed-forward width, etc.) so you can tailor the temporal model to your dataset.
 
+### Multi-branch harmonic and energy heads
+`model_params.architecture` selects the high-level network topology. Set it to `rmvpe` (the default) to enable the new multi-branch convolutional backbone with harmonic- and energy-aware heads inspired by RMVPE. Each branch captures a different temporal scale before the features are fused and passed to the sequence model. The harmonic head estimates the reliability of harmonic structure while the energy head approximates frame energy, and both act as confidence weights on the regression output. This combination tends to suppress spurious octave jumps on noisy or highly expressive singing voice data. Switch the value back to `jdc` to recover the original single-branch JDC network if you need backwards compatibility.
+
 ### IMPORTANT: DATA FOLDER NEEDS WRITE PERMISSION
 Since both `harvest` and `dio` are relatively slow, we do have to save the computed F0 ground truth for later use. In [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py#L77-L89), it will write the computed F0 curve `_f0.npy` for each `.wav` file. This requires write permission in your data folder.
 

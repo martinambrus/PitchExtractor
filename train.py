@@ -1,4 +1,4 @@
-from model import JDCNet
+from model import build_pitch_model
 from meldataset import build_dataloader
 from optimizers import build_optimizer
 from trainer import Trainer
@@ -83,11 +83,7 @@ def main(config_path):
 
     # define model
     model_config = config.get('model_params', {})
-    sequence_model_config = model_config.get('sequence_model', {})
-    model = JDCNet(
-        num_class=model_config.get('num_class', 1),  # num_class = 1 means regression
-        sequence_model_config=sequence_model_config,
-    )
+    model = build_pitch_model(model_config)
 
     scheduler_params = {
             "max_lr": float(config['optimizer_params'].get('lr', 5e-4)),
