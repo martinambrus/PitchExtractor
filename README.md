@@ -55,6 +55,49 @@ Whenever the backend configuration changes the dataset automatically regenerates
 
 The optional `dataset_params.dataloader` dictionary lets you fine-tune how the `DataLoader` is constructed (for example, setting `start_method`, `persistent_workers`, or `prefetch_factor`). When omitted the builder keeps PyTorch defaults, only forcing `start_method: spawn` when CUDA-enabled F0 backends would otherwise hit the "Cannot re-initialize CUDA in forked subprocess" error.
 
+### Hybrid DSP–ML pitch features
+
+To emulate fused trackers such as FusedF0 the loader can derive auxiliary DSP
+pitch trajectories alongside the neural mel spectrogram. Enable the block below
+inside `dataset_params` to append autocorrelation, cepstrum, harmonic summation,
+and (optionally) PyWorld Harvest F0 tracks as additional channels:
+
+```yaml
+dataset_params:
+  dsp_features:
+    enabled: true
+    algorithms: [autocorr, cepstrum, harmonic, harvest]
+    fmin: 50.0
+    fmax: 1100.0
+```
+
+Each algorithm contributes one per-frame curve that is tiled across the
+frequency axis and fed into the convolutional front-end. You can trim the list
+to reduce compute or tweak the search range thresholds. When Harvest is
+requested but `pyworld` is unavailable the loader will automatically fall back
+to the remaining DSP features.
+
+During evaluation you can optionally fuse the neural regression output with the
+DSP curves to mitigate octave hops. Add a `training.fusion` section to weight
+each contributor and control the octave tolerance:
+
+```yaml
+training:
+  fusion:
+    enabled: true
+    neural_weight: 1.5
+    octave_tolerance_cents: 120.0
+    weights:
+      autocorr: 1.0
+      cepstrum: 0.8
+      harmonic: 1.2
+      harvest: 1.5
+```
+
+The fused loss is reported in the training and validation logs (`fused_f0`) so
+you can monitor how the hybrid estimate behaves without altering the core
+regression objective.
+
 ### Data Augmentation
 Data augmentation is not included in this code. For better voice conversion results, please add your own data augmentation in [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py) with [audiomentations](https://github.com/iver56/audiomentations).
 

@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - optional dependency
 from Utils.synthetic import WorldSynthesizer
 
 from f0_backends import BackendComputationError, build_f0_extractor
+from hybrid_features import HybridFeatureBuilder
 
 import logging
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class MelDataset(torch.utils.data.Dataset):
                  validation=False,
                  verbose=True,
                  synthetic_data=None,
+                 dsp_features=None,
                  ):
 
         self.verbose = verbose
@@ -115,6 +117,30 @@ class MelDataset(torch.utils.data.Dataset):
         self.zero_value = float(self.f0_params.get('zero_fill_value', 0.0))
         self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
 
+        # DSP feature builder for hybrid DSP/ML training
+        dsp_features = dsp_features or {}
+        self._dsp_feature_config = dict(dsp_features)
+        self.dsp_feature_builder = None
+        if bool(dsp_features.get('enabled', False)):
+            try:
+                self.dsp_feature_builder = HybridFeatureBuilder(
+                    sample_rate=self.sr,
+                    hop_length=self.mel_params['hop_length'],
+                    frame_length=self.mel_params.get('win_length') or self.mel_params.get('n_fft'),
+                    config=dsp_features,
+                    verbose=self.verbose,
+                )
+                if self.verbose:
+                    description = self.dsp_feature_builder.describe()
+                    print(f"[MelDataset] Hybrid DSP features enabled: {description}")
+            except Exception as exc:
+                self.dsp_feature_builder = None
+                if self.verbose:
+                    print(f"[MelDataset] Failed to initialise hybrid DSP features: {exc}")
+                logger.warning("Failed to initialise hybrid DSP features: %s", exc)
+        self.dsp_feature_names = self.dsp_feature_builder.feature_names if self.dsp_feature_builder else []
+        self.input_channels = 1 + (self.dsp_feature_builder.feature_count if self.dsp_feature_builder else 0)
+
         # synthetic augmentation configuration
         self._base_length = len(self.data_list)
         self.synthetic_config = synthetic_data or {}
@@ -151,15 +177,26 @@ class MelDataset(torch.utils.data.Dataset):
             'config': self.f0_params,
             'verbose': self.verbose,
         }
+        dsp_state = None
+        if self.dsp_feature_builder is not None:
+            dsp_state = {
+                'sample_rate': self.sr,
+                'hop_length': self.mel_params['hop_length'],
+                'frame_length': self.dsp_feature_builder.frame_length,
+                'config': self._dsp_feature_config,
+            }
+        state['_dsp_builder_state'] = dsp_state
         # ``torchaudio`` transforms and backend instances hold module
         # references that cannot be pickled.  Drop them here and rebuild in
         # ``__setstate__`` when the worker process deserialises the dataset.
         state.pop('f0_extractor', None)
         state.pop('to_melspec', None)
+        state.pop('dsp_feature_builder', None)
         return state
 
     def __setstate__(self, state):
         extractor_init = state.pop('_f0_extractor_init')
+        dsp_state = state.pop('_dsp_builder_state', None)
         self.__dict__.update(state)
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**self.mel_params)
         self.f0_extractor = build_f0_extractor(
@@ -172,6 +209,22 @@ class MelDataset(torch.utils.data.Dataset):
         self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
         self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
         self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
+        self.dsp_feature_builder = None
+        if dsp_state is not None:
+            try:
+                self.dsp_feature_builder = HybridFeatureBuilder(
+                    sample_rate=dsp_state.get('sample_rate', self.sr),
+                    hop_length=dsp_state.get('hop_length', self.mel_params['hop_length']),
+                    frame_length=dsp_state.get('frame_length'),
+                    config=dsp_state.get('config', {}),
+                    verbose=self.verbose,
+                )
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[MelDataset] Failed to restore hybrid DSP features: {exc}")
+                logger.warning("Failed to restore hybrid DSP features: %s", exc)
+        self.dsp_feature_names = self.dsp_feature_builder.feature_names if self.dsp_feature_builder else []
+        self.input_channels = 1 + (self.dsp_feature_builder.feature_count if self.dsp_feature_builder else 0)
 
     def path_to_mel_and_label(self, path):
         metadata = self._get_audio_metadata(path)
@@ -621,15 +674,31 @@ class MelDataset(torch.utils.data.Dataset):
         is_silence[f0_zero] = 1
         #######################################
 
+        dsp_tensor = None
+        if self.dsp_feature_builder is not None:
+            try:
+                dsp_array = self.dsp_feature_builder.compute_aligned(waveform, mel_length)
+            except Exception as exc:
+                dsp_array = None
+                logger.warning("Failed to compute hybrid DSP features: %s", exc)
+                if self.verbose:
+                    print(f"[MelDataset] Failed to compute hybrid DSP features: {exc}")
+            if dsp_array is not None:
+                dsp_tensor = torch.from_numpy(dsp_array).float()
+
         if mel_length > self.max_mel_length:
             random_start = np.random.randint(0, mel_length - self.max_mel_length)
             mel_tensor = mel_tensor[:, random_start:random_start + self.max_mel_length]
             f0_tensor = f0_tensor[random_start:random_start + self.max_mel_length]
             is_silence = is_silence[random_start:random_start + self.max_mel_length]
+            if dsp_tensor is not None:
+                dsp_tensor = dsp_tensor[:, random_start:random_start + self.max_mel_length]
 
         if torch.any(torch.isnan(f0_tensor)):  # failed
             f0_tensor[torch.isnan(f0_tensor)] = self.zero_value  # replace nan value with 0
 
+        if dsp_tensor is not None:
+            return mel_tensor, f0_tensor, is_silence, dsp_tensor
         return mel_tensor, f0_tensor, is_silence
 
     def _build_mel_metadata(self, wave_tensor, wave_sr):
@@ -758,27 +827,43 @@ class Collater(object):
         self.latent_dim = 16
 
     def __call__(self, batch):
-        # batch[0] = wave, mel, text, f0, speakerid
         batch_size = len(batch)
         nmels = batch[0][0].size(0)
+        has_dsp = len(batch[0]) >= 4 and batch[0][3] is not None
+
         mels = torch.zeros((batch_size, nmels, self.max_mel_length)).float()
         f0s = torch.zeros((batch_size, self.max_mel_length)).float()
         is_silences = torch.zeros((batch_size, self.max_mel_length)).float()
+        dsp_channels = batch[0][3].size(0) if has_dsp else 0
+        dsp_features = None
+        if has_dsp:
+            dsp_features = torch.zeros((batch_size, dsp_channels, self.max_mel_length)).float()
 
-        for bid, (mel, f0, is_silence) in enumerate(batch):
+        for bid, sample in enumerate(batch):
+            mel, f0, is_silence = sample[:3]
+            dsp_tensor = sample[3] if has_dsp and len(sample) > 3 else None
             mel_size = mel.size(1)
             mels[bid, :, :mel_size] = mel
             f0s[bid, :mel_size] = f0
             is_silences[bid, :mel_size] = is_silence
+            if has_dsp and dsp_tensor is not None:
+                dsp_features[bid, :, :mel_size] = dsp_tensor
 
         if self.max_mel_length > self.min_mel_length:
             random_slice = np.random.randint(
-                self.min_mel_length//self.mel_length_step,
-                1+self.max_mel_length//self.mel_length_step) * self.mel_length_step + self.min_mel_length
+                self.min_mel_length // self.mel_length_step,
+                1 + self.max_mel_length // self.mel_length_step) * self.mel_length_step + self.min_mel_length
             mels = mels[:, :, :random_slice]
-            f0 = f0[:, :random_slice]
+            f0s = f0s[:, :random_slice]
+            is_silences = is_silences[:, :random_slice]
+            if has_dsp and dsp_features is not None:
+                dsp_features = dsp_features[:, :, :random_slice]
 
         mels = mels.unsqueeze(1)
+        if has_dsp and dsp_features is not None:
+            dsp_maps = dsp_features.unsqueeze(2).expand(-1, -1, nmels, -1)
+            mels = torch.cat([mels, dsp_maps], dim=1)
+            return mels, f0s, is_silences, dsp_features
         return mels, f0s, is_silences
 
 

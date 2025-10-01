@@ -14,14 +14,18 @@ class JDCNet(nn.Module):
     """
     Joint Detection and Classification Network model for singing voice melody.
     """
-    def __init__(self, num_class=722, leaky_relu_slope=0.01, sequence_model_config=None):
+
+    def __init__(self, num_class=722, leaky_relu_slope=0.01, sequence_model_config=None, input_channels: int = 1):
         super().__init__()
         self.num_class = num_class
         sequence_model_config = sequence_model_config or {}
 
+        if input_channels <= 0:
+            raise ValueError("input_channels must be a positive integer")
+
         # input = (b, 1, 31, 513), b = batch size
         self.conv_block = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=64, kernel_size=3, padding=1, bias=False),  # out: (b, 64, 31, 513)
+            nn.Conv2d(in_channels=input_channels, out_channels=64, kernel_size=3, padding=1, bias=False),  # out: (b, 64, 31, 513)
             nn.BatchNorm2d(num_features=64),
             nn.LeakyReLU(leaky_relu_slope, inplace=True),
             nn.Conv2d(64, 64, 3, padding=1, bias=False),  # (b, 64, 31, 513)

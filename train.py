@@ -69,10 +69,11 @@ def main(config_path):
 
     train_list, val_list = get_data_path_list(train_path, val_path)
 
+    dataset_params = config.get('dataset_params', {})
     train_dataloader = build_dataloader(train_list,
                                         batch_size=batch_size,
                                         num_workers=num_workers,
-                                        dataset_config=config.get('dataset_params', {}),
+                                        dataset_config=dataset_params,
                                         device=device)
 
     val_dataloader = build_dataloader(val_list,
@@ -80,7 +81,9 @@ def main(config_path):
                                       validation=True,
                                       num_workers=num_workers // 2,
                                       device=device,
-                                      dataset_config=config.get('dataset_params', {}))
+                                      dataset_config=dataset_params)
+
+    input_channels = getattr(train_dataloader.dataset, 'input_channels', 1)
 
     # define model
     model_config = config.get('model_params', {})
@@ -88,6 +91,7 @@ def main(config_path):
     model = JDCNet(
         num_class=model_config.get('num_class', 1),  # num_class = 1 means regression
         sequence_model_config=sequence_model_config,
+        input_channels=model_config.get('input_channels', input_channels),
     )
 
     scheduler_params = {
@@ -107,6 +111,8 @@ def main(config_path):
 
     loss_config = config['loss_params']
 
+    fusion_config = training_config.get('fusion', {})
+
     trainer = Trainer(model=model,
                         criterion=criterion,
                         optimizer=optimizer,
@@ -118,7 +124,9 @@ def main(config_path):
                         logger=logger,
                         use_mixed_precision=training_config.get('mixed_precision', True),
                         gradient_checkpointing=training_config.get('gradient_checkpointing', False),
-                        checkpoint_use_reentrant=training_config.get('gradient_checkpointing_use_reentrant'))
+                        checkpoint_use_reentrant=training_config.get('gradient_checkpointing_use_reentrant'),
+                        fusion_config=fusion_config,
+                        config=training_config)
 
     if config.get('pretrained_model', '') != '':
         trainer.load_checkpoint(config['pretrained_model'],

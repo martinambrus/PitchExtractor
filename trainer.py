@@ -29,6 +29,8 @@ except (ImportError, AttributeError):
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+from hybrid_features import fuse_f0_predictions
+
 class Trainer(object):
     def __init__(self,
                  model=None,
@@ -45,7 +47,8 @@ class Trainer(object):
                  initial_epochs=0,
                  use_mixed_precision=False,
                  gradient_checkpointing=False,
-                 checkpoint_use_reentrant=None):
+                 checkpoint_use_reentrant=None,
+                 fusion_config=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -60,6 +63,11 @@ class Trainer(object):
         self.device = device
         self.finish_train = False
         self.logger = logger
+        self.dsp_feature_names = []
+        if train_dataloader is not None:
+            self.dsp_feature_names = getattr(train_dataloader.dataset, "dsp_feature_names", [])
+        if not self.dsp_feature_names and val_dataloader is not None:
+            self.dsp_feature_names = getattr(val_dataloader.dataset, "dsp_feature_names", [])
         device_type = torch.device(self.device).type if isinstance(self.device, (str, torch.device)) else "cpu"
         self.use_amp = bool(use_mixed_precision and device_type == "cuda")
         if TorchGradScaler is not None:
@@ -134,6 +142,15 @@ class Trainer(object):
                     self.gradient_checkpoint_use_reentrant,
                 )
                 self._checkpoint_kwargs["use_reentrant"] = self.gradient_checkpoint_use_reentrant
+
+        fusion_config = dict(fusion_config or config.get('fusion', {}))
+        self.fusion_enabled = bool(fusion_config.get('enabled', False))
+        self.fusion_neural_weight = float(fusion_config.get('neural_weight', 1.5))
+        self.fusion_octave_tolerance = float(fusion_config.get('octave_tolerance_cents', 120.0))
+        self.fusion_weights = fusion_config.get('weights', {}) or {}
+        if self.fusion_enabled and not self.dsp_feature_names:
+            self.logger.warning("Fusion requested but no DSP features are available; disabling fusion.")
+            self.fusion_enabled = False
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -220,7 +237,11 @@ class Trainer(object):
         self.optimizer.zero_grad(set_to_none=True)
         batch = [b.to(self.device, non_blocking=True) for b in batch]
 
-        x, f0, sil = batch
+        if len(batch) == 4:
+            x, f0, sil, dsp = batch
+        else:
+            x, f0, sil = batch
+            dsp = None
         autocast_context = self._autocast_cm
 
         with autocast_context():
@@ -247,9 +268,21 @@ class Trainer(object):
             self.optimizer.step()
         self.scheduler.step()
 
-        return {'loss': loss.item(),
-                'f0': loss_f0.item(),
-                'sil': loss_sil.item()}
+        results = {'loss': loss.item(),
+                   'f0': loss_f0.item(),
+                   'sil': loss_sil.item()}
+        if self.fusion_enabled and dsp is not None:
+            fused = fuse_f0_predictions(
+                f0_pred.squeeze(),
+                dsp,
+                feature_names=self.dsp_feature_names,
+                weights=self.fusion_weights,
+                neural_weight=self.fusion_neural_weight,
+                octave_tolerance_cents=self.fusion_octave_tolerance,
+            )
+            fusion_loss = self.loss_config['lambda_f0'] * self.criterion['l1'](fused, f0)
+            results['fused_f0'] = fusion_loss.item()
+        return results
 
     def _train_epoch(self):
         self.epochs += 1
@@ -271,7 +304,11 @@ class Trainer(object):
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
             batch = [b.to(self.device, non_blocking=True) for b in batch]
-            x, f0, sil = batch
+            if len(batch) == 4:
+                x, f0, sil, dsp = batch
+            else:
+                x, f0, sil = batch
+                dsp = None
 
             autocast_context = self._autocast_cm
             with autocast_context():
@@ -285,7 +322,18 @@ class Trainer(object):
             eval_losses["eval/loss"].append(loss.item())
             eval_losses["eval/f0"].append(loss_f0.item())
             eval_losses["eval/sil"].append(loss_sil.item())
-            
+            if self.fusion_enabled and dsp is not None:
+                fused = fuse_f0_predictions(
+                    f0_pred.squeeze(),
+                    dsp,
+                    feature_names=self.dsp_feature_names,
+                    weights=self.fusion_weights,
+                    neural_weight=self.fusion_neural_weight,
+                    octave_tolerance_cents=self.fusion_octave_tolerance,
+                )
+                fusion_loss = self.loss_config['lambda_f0'] * self.criterion['l1'](fused, f0)
+                eval_losses["eval/fused_f0"].append(fusion_loss.item())
+
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)
         return eval_losses

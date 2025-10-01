@@ -12,6 +12,15 @@ training:
   mixed_precision: true
   gradient_checkpointing: false
   gradient_checkpointing_use_reentrant: false
+  fusion:
+    enabled: false
+    neural_weight: 1.5
+    octave_tolerance_cents: 120.0
+    weights:
+      autocorr: 1.0
+      cepstrum: 0.8
+      harmonic: 1.2
+      harvest: 1.5
 
 model_params:
   num_class: 1
@@ -37,6 +46,11 @@ dataset_params:
     n_fft: 1024
     n_mels: 80
     hop_length: 300
+  dsp_features:
+    enabled: false
+    algorithms: [autocorr, cepstrum, harmonic, harvest]
+    fmin: 50.0
+    fmax: 1100.0
   # Optional DataLoader overrides. Leave fields as null to accept the defaults.
   # When left unspecified the loader automatically switches to ``start_method:
   # spawn`` whenever a CUDA-enabled F0 backend is active so GPU extraction works
