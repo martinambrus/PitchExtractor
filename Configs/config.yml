@@ -43,6 +43,16 @@ dataset_params:
   f0_params:
     bad_f0_threshold: 5
     zero_fill_value: 0.0
+    postprocess:
+      enabled: true
+      median:
+        enabled: true
+        size: 5
+      viterbi:
+        enabled: true
+        step_cents: 20.0
+        transition_penalty: 0.4
+        observation_sigma: 35.0
     # Ordered list of backend names to try when computing F0. Each entry must
     # match a key below in the ``backends`` dictionary and will be attempted in
     # sequence until one produces a valid contour.

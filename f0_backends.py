@@ -19,12 +19,30 @@ import dataclasses
 import inspect
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _sliding_window_view(array: np.ndarray, window_size: int) -> np.ndarray:
+    """Return a sliding window view of ``array`` with graceful fallback."""
+
+    try:
+        from numpy.lib.stride_tricks import sliding_window_view  # type: ignore
+
+        return sliding_window_view(array, window_size)
+    except Exception:  # pragma: no cover - fallback for older numpy
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        length = array.shape[-1] - window_size + 1
+        if length <= 0:
+            raise ValueError("window size larger than input")
+        shape = array.shape[:-1] + (length, window_size)
+        strides = array.strides + (array.strides[-1],)
+        return np.lib.stride_tricks.as_strided(array, shape=shape, strides=strides)
 
 
 class BackendUnavailableError(RuntimeError):
@@ -104,6 +122,144 @@ class BaseF0Backend:
     # API surface expected from subclasses
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:  # pragma: no cover - abstract
         raise NotImplementedError
+
+
+@dataclasses.dataclass
+class TemporalSmoothingConfig:
+    median_size: int
+    median_enabled: bool
+    viterbi_enabled: bool
+    viterbi_step_cents: float
+    viterbi_transition_penalty: float
+    viterbi_observation_sigma: float
+
+
+class F0TemporalSmoother:
+    """Apply temporal smoothing to F0 trajectories to reduce artefacts."""
+
+    def __init__(self, settings: TemporalSmoothingConfig) -> None:
+        self.settings = settings
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def from_config(config: Dict) -> "F0TemporalSmoother":
+        config = dict(config or {})
+        median_cfg = dict(config.get("median", {}))
+        median_enabled = _coerce_enabled_flag(median_cfg.get("enabled", True))
+        median_size = int(median_cfg.get("size", median_cfg.get("kernel_size", 5)) or 0)
+        if median_size < 0:
+            raise ValueError("Median filter size must be >= 0")
+        viterbi_cfg = dict(config.get("viterbi", {}))
+        viterbi_enabled = _coerce_enabled_flag(viterbi_cfg.get("enabled", True))
+        viterbi_step_cents = float(viterbi_cfg.get("step_cents", 25.0) or 0.0)
+        if viterbi_step_cents < 0:
+            raise ValueError("Viterbi step size must be >= 0")
+        viterbi_transition_penalty = float(viterbi_cfg.get("transition_penalty", 0.5) or 0.0)
+        if viterbi_transition_penalty < 0:
+            raise ValueError("Viterbi transition penalty must be >= 0")
+        viterbi_observation_sigma = float(viterbi_cfg.get("observation_sigma", 35.0) or 1.0)
+        if viterbi_observation_sigma <= 0:
+            raise ValueError("Viterbi observation sigma must be > 0")
+        settings = TemporalSmoothingConfig(
+            median_size=median_size,
+            median_enabled=median_enabled and median_size > 1,
+            viterbi_enabled=viterbi_enabled,
+            viterbi_step_cents=viterbi_step_cents if viterbi_step_cents > 0 else 0.0,
+            viterbi_transition_penalty=viterbi_transition_penalty,
+            viterbi_observation_sigma=viterbi_observation_sigma,
+        )
+        return F0TemporalSmoother(settings)
+
+    # ------------------------------------------------------------------
+    def __call__(self, f0: np.ndarray) -> np.ndarray:
+        if f0.size == 0:
+            return f0
+        result = np.asarray(f0, dtype=np.float64)
+        voiced_mask = result > 0
+        if not np.any(voiced_mask):
+            return result
+        if self.settings.median_enabled:
+            result = self._apply_segmentwise(result, voiced_mask, self._median_filter_segment)
+        if self.settings.viterbi_enabled and self.settings.viterbi_step_cents > 0:
+            result = self._apply_segmentwise(result, voiced_mask, self._viterbi_segment)
+        return result
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _iter_segments(mask: np.ndarray) -> Iterator[slice]:
+        indices = np.flatnonzero(mask)
+        if indices.size == 0:
+            return
+        start = indices[0]
+        previous = indices[0]
+        for idx in indices[1:]:
+            if idx != previous + 1:
+                yield slice(start, previous + 1)
+                start = idx
+            previous = idx
+        yield slice(start, previous + 1)
+
+    # ------------------------------------------------------------------
+    def _apply_segmentwise(
+        self, values: np.ndarray, mask: np.ndarray, func: Callable[[np.ndarray], np.ndarray]
+    ) -> np.ndarray:
+        output = values.copy()
+        for segment in self._iter_segments(mask):
+            output[segment] = func(output[segment])
+        return output
+
+    # ------------------------------------------------------------------
+    def _median_filter_segment(self, segment: np.ndarray) -> np.ndarray:
+        size = int(self.settings.median_size)
+        if size <= 1 or segment.size <= 2:
+            return segment
+        if size % 2 == 0:
+            size += 1
+        pad = size // 2
+        padded = np.pad(segment, (pad,), mode="edge")
+        windows = _sliding_window_view(padded, size)
+        medians = np.median(windows, axis=-1)
+        return medians
+
+    # ------------------------------------------------------------------
+    def _viterbi_segment(self, segment: np.ndarray) -> np.ndarray:
+        if segment.size <= 1:
+            return segment
+        cents = 1200.0 * np.log2(segment)
+        min_cents = cents.min()
+        max_cents = cents.max()
+        step = self.settings.viterbi_step_cents
+        if not np.isfinite(min_cents) or not np.isfinite(max_cents) or step <= 0:
+            return segment
+        states = np.arange(min_cents, max_cents + step * 0.5, step)
+        if states.size == 0:
+            return segment
+        sigma = self.settings.viterbi_observation_sigma
+        emission_costs = (cents[:, None] - states[None, :]) ** 2 / (2.0 * sigma ** 2)
+        transition_penalty = self.settings.viterbi_transition_penalty
+        if transition_penalty > 0:
+            transition_cost = transition_penalty * np.abs(states[None, :] - states[:, None]) / step
+        else:
+            transition_cost = np.zeros((states.size, states.size), dtype=np.float64)
+
+        dp = np.empty_like(emission_costs)
+        backpointers = np.empty_like(emission_costs, dtype=np.int32)
+        dp[0] = emission_costs[0]
+        backpointers[0] = -1
+        for t in range(1, segment.size):
+            prev = dp[t - 1][:, None] + transition_cost
+            best_prev = np.argmin(prev, axis=0)
+            dp[t] = emission_costs[t, np.arange(states.size)] + prev[best_prev, np.arange(states.size)]
+            backpointers[t] = best_prev
+
+        path = np.empty(segment.size, dtype=np.int32)
+        path[-1] = int(np.argmin(dp[-1]))
+        for t in range(segment.size - 1, 0, -1):
+            path[t - 1] = backpointers[t, path[t]]
+
+        smoothed_cents = states[path]
+        smoothed_segment = np.power(2.0, smoothed_cents / 1200.0)
+        return smoothed_segment.astype(np.float64)
 
 
 class PyWorldBackend(BaseF0Backend):
@@ -659,6 +815,11 @@ class F0Extractor:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Invalid zero_fill_value: {zero_fill!r}") from exc
 
+        postprocess_cfg = config.get("postprocess") or {}
+        self._postprocess = None
+        if _coerce_enabled_flag(postprocess_cfg.get("enabled", True)):
+            self._postprocess = F0TemporalSmoother.from_config(postprocess_cfg)
+
         backends_config = config.get("backends") or {}
         sequence_config = config.get("backend_order")
         if sequence_config:
@@ -780,6 +941,8 @@ class F0Extractor:
                     int(np.count_nonzero(f0)),
                 )
                 continue
+            if self._postprocess is not None:
+                f0 = self._postprocess(f0)
             return BackendResult(f0=f0, backend_name=backend.name)
 
         raise BackendComputationError("All configured F0 backends failed to produce a valid contour.")
