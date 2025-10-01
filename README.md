@@ -55,6 +55,25 @@ The optional `dataset_params.dataloader` dictionary lets you fine-tune how the `
 ### Data Augmentation
 Data augmentation is not included in this code. For better voice conversion results, please add your own data augmentation in [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py) with [audiomentations](https://github.com/iver56/audiomentations).
 
+### Synthetic supervision and pitch shifting
+
+`MelDataset` now supports optional synthetic supervision so you can mix
+perfectly-labeled examples into training, mirroring the strategy used for
+SwiftF0. Enable the feature via the `dataset_params.synthetic_augmentation`
+section in [`Configs/config.yml`](Configs/config.yml). When active, the loader
+can:
+
+- Generate speech-like harmonic stacks with precise ground-truth F0 and
+  user-configurable characteristics (duration, vibrato depth, harmonic count,
+  voiced/unvoiced ratios, etc.).
+- Pitch-shift existing recordings while analytically transforming their F0
+  labels, providing additional coverage without recomputing cached contours.
+
+You can specify either a relative `ratio` or an absolute `num_samples` of
+synthetic clips per epoch. Even a small amount of perfectly-labeled synthetic
+data can calibrate the extractor, while the pitch-shift pathway expands the
+coverage of challenging registers.
+
 ## References
 - [keums/melodyExtraction_JDC](https://github.com/keums/melodyExtraction_JDC)
 - [kan-bayashi/ParallelWaveGAN](https://github.com/kan-bayashi/ParallelWaveGAN)

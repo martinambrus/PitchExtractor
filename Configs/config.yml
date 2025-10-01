@@ -40,6 +40,37 @@ dataset_params:
     start_method: null
     persistent_workers: null
     prefetch_factor: null
+  synthetic_augmentation:
+    enabled: false
+    ratio: 0.0  # alternatively set num_samples for an absolute count
+    num_samples: 0
+    generator:
+      min_duration: 0.8
+      max_duration: 2.5
+      min_f0: 70.0
+      max_f0: 450.0
+      num_harmonics: 6
+      harmonic_decay: 1.6
+      vibrato_semitones: 0.4
+      vibrato_rate_hz: 5.5
+      max_glide_semitones: 5.0
+      noise_std: 0.0025
+      breath_noise_std: 0.0015
+      unvoiced_probability: 0.2
+      unvoiced_min_duration: 0.04
+      unvoiced_max_duration: 0.18
+      attack_time: 0.02
+      release_time: 0.05
+      amplitude_min: 0.6
+      amplitude_max: 0.9
+      jitter_semitones: 0.05
+      seed: 1729
+    pitch_shift:
+      enabled: false
+      probability: 0.0
+      semitones: [-3, -2, -1, 1, 2, 3]
+      bins_per_octave: 12
+      seed: 1234
   f0_params:
     bad_f0_threshold: 5
     zero_fill_value: 0.0

@@ -1,5 +1,6 @@
 #coding: utf-8
 import glob
+import math
 import os
 import os.path as osp
 import time
@@ -14,6 +15,7 @@ import torchaudio
 from torch.utils.data import DataLoader
 
 from f0_backends import BackendComputationError, build_f0_extractor
+from synthetic import SyntheticSpeechGenerator
 
 import logging
 logger = logging.getLogger(__name__)
@@ -38,12 +40,14 @@ class MelDataset(torch.utils.data.Dataset):
                  f0_params=None,
                  data_augmentation=False,
                  validation=False,
-                 verbose=True
+                 verbose=True,
+                 synthetic_augmentation=None
                  ):
 
         self.verbose = verbose
         _data_list = [l[:-1].split('|') for l in data_list]
         self.data_list = [d[0] for d in _data_list]
+        self.num_real_samples = len(self.data_list)
 
         mel_params = mel_params or {}
         if 'win_len' in mel_params and 'win_length' not in mel_params:
@@ -103,8 +107,46 @@ class MelDataset(torch.utils.data.Dataset):
         self.zero_value = float(self.f0_params.get('zero_fill_value', 0.0))
         self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
 
+        self.synthetic_config = synthetic_augmentation or {}
+        self.synthetic_enabled = bool(self.synthetic_config.get('enabled', False)) and (not validation)
+        self.synthetic_ratio = float(self.synthetic_config.get('ratio', 0.0)) if self.synthetic_enabled else 0.0
+        self.synthetic_num_samples = int(self.synthetic_config.get('num_samples', 0)) if self.synthetic_enabled else 0
+        self.synthetic_generator = None
+        if self.synthetic_enabled:
+            generator_config = self.synthetic_config.get('generator', {}) or {}
+            try:
+                self.synthetic_generator = SyntheticSpeechGenerator(
+                    sample_rate=self.sr,
+                    hop_length=self.mel_params['hop_length'],
+                    mel_transform=self.to_melspec,
+                    mean=self.mean,
+                    std=self.std,
+                    config=generator_config,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to initialise synthetic speech generator: {exc}") from exc
+
+        if self.synthetic_enabled:
+            if self.synthetic_num_samples <= 0 and self.synthetic_ratio > 0.0:
+                self.synthetic_num_samples = max(1, int(math.ceil(self.num_real_samples * self.synthetic_ratio)))
+            self.synthetic_num_samples = max(0, self.synthetic_num_samples)
+        else:
+            self.synthetic_num_samples = 0
+
+        self.pitch_shift_config = self.synthetic_config.get('pitch_shift', {}) or {}
+        self.pitch_shift_enabled = bool(self.pitch_shift_config.get('enabled', False)) and (not validation)
+        self.pitch_shift_probability = float(self.pitch_shift_config.get('probability', 0.0)) if self.pitch_shift_enabled else 0.0
+        raw_steps = self.pitch_shift_config.get('semitones', [])
+        if isinstance(raw_steps, (int, float)):
+            raw_steps = [raw_steps]
+        self.pitch_shift_steps = [float(step) for step in raw_steps if step not in (None, '')]
+        self.pitch_shift_bins_per_octave = int(self.pitch_shift_config.get('bins_per_octave', 12)) if self.pitch_shift_enabled else 12
+        if self.pitch_shift_enabled and not self.pitch_shift_steps:
+            self.pitch_shift_enabled = False
+        self.pitch_shift_rng = random.Random(int(self.pitch_shift_config.get('seed', 1234)))
+
     def __len__(self):
-        return len(self.data_list)
+        return self.num_real_samples + self.synthetic_num_samples
 
     # ------------------------------------------------------------------
     # Multiprocessing support helpers
@@ -118,15 +160,21 @@ class MelDataset(torch.utils.data.Dataset):
             'config': self.f0_params,
             'verbose': self.verbose,
         }
+        state['_synthetic_generator_init'] = {
+            'enabled': self.synthetic_enabled,
+            'config': self.synthetic_config,
+        }
         # ``torchaudio`` transforms and backend instances hold module
         # references that cannot be pickled.  Drop them here and rebuild in
         # ``__setstate__`` when the worker process deserialises the dataset.
         state.pop('f0_extractor', None)
         state.pop('to_melspec', None)
+        state.pop('synthetic_generator', None)
         return state
 
     def __setstate__(self, state):
         extractor_init = state.pop('_f0_extractor_init')
+        synth_init = state.pop('_synthetic_generator_init', None)
         self.__dict__.update(state)
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**self.mel_params)
         self.f0_extractor = build_f0_extractor(
@@ -139,6 +187,19 @@ class MelDataset(torch.utils.data.Dataset):
         self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
         self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
         self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
+        if synth_init and synth_init.get('enabled'):
+            self.synthetic_generator = SyntheticSpeechGenerator(
+                sample_rate=self.sr,
+                hop_length=self.mel_params['hop_length'],
+                mel_transform=self.to_melspec,
+                mean=self.mean,
+                std=self.std,
+                config=synth_init.get('config', {}),
+            )
+        else:
+            self.synthetic_generator = None
+        if self.pitch_shift_enabled:
+            self.pitch_shift_rng = random.Random(int(self.pitch_shift_config.get('seed', 1234)))
 
     def path_to_mel_and_label(self, path):
         wave_tensor, wave_sr = self._load_tensor(path)
@@ -150,18 +211,23 @@ class MelDataset(torch.utils.data.Dataset):
             waveform = self._resample_waveform(waveform, wave_sr, self.sr)
             wave_sr = self.sr
 
-        f0 = self._load_or_compute_f0(path, waveform, wave_sr)
-        
+        waveform_for_f0 = np.copy(waveform)
+        f0 = self._load_or_compute_f0(path, waveform_for_f0, wave_sr)
+
+        pitch_shift_applied = False
+        if self._should_apply_pitch_shift():
+            waveform, f0, pitch_shift_applied = self._apply_pitch_shift(waveform, f0, wave_sr)
+
         if self.data_augmentation:
             random_scale = 0.5 + 0.5 * np.random.random()
-            wave_tensor = random_scale * wave_tensor
+            waveform = waveform * random_scale
 
         wave_tensor = torch.from_numpy(waveform).float()
         expected_metadata = self._build_mel_metadata(wave_tensor, wave_sr)
-        mel_tensor = self._load_cached_mel(path, expected_metadata)
+        mel_tensor = self._load_cached_mel(path, expected_metadata, allow_cache=(not pitch_shift_applied))
         if mel_tensor is None:
             mel_tensor = self.to_melspec(wave_tensor)
-            if self._cache_enabled and not self.data_augmentation:
+            if self._cache_enabled and not self.data_augmentation and not pitch_shift_applied:
                 self._save_mel_cache(path, mel_tensor, expected_metadata)
         mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
         mel_length = mel_tensor.size(1)
@@ -189,10 +255,80 @@ class MelDataset(torch.utils.data.Dataset):
 
         return mel_tensor, f0, is_silence
 
+    def _should_apply_pitch_shift(self):
+        if not self.pitch_shift_enabled:
+            return False
+        if self.pitch_shift_probability <= 0.0:
+            return False
+        return self.pitch_shift_rng.random() < self.pitch_shift_probability
+
+    def _apply_pitch_shift(self, waveform, f0, sr):
+        steps = self.pitch_shift_rng.choice(self.pitch_shift_steps)
+        if abs(steps) < 1e-6:
+            return waveform, f0, False
+
+        waveform_tensor = torch.from_numpy(waveform).unsqueeze(0)
+        shifted_tensor = torchaudio.functional.pitch_shift(
+            waveform_tensor,
+            sr,
+            n_steps=float(steps),
+            bins_per_octave=self.pitch_shift_bins_per_octave,
+        )
+        shifted = shifted_tensor.squeeze(0).cpu().numpy()
+        if np.max(np.abs(shifted)) > 0:
+            shifted = shifted / max(1.0, np.max(np.abs(shifted)))
+
+        scale = 2 ** (float(steps) / float(self.pitch_shift_bins_per_octave))
+        shifted_f0 = np.asarray(f0, dtype=np.float32).copy()
+        voiced_mask = shifted_f0 > 0
+        shifted_f0[voiced_mask] *= scale
+        return shifted.astype(np.float32), shifted_f0.astype(np.float32), True
+
+    def _generate_synthetic_item(self, index):
+        if self.synthetic_generator is None:
+            raise RuntimeError("Synthetic augmentation requested but generator is not initialised.")
+
+        synthetic = self.synthetic_generator.generate(index=index)
+        waveform = synthetic['waveform']
+        f0 = synthetic['f0']
+        voiced = synthetic.get('voiced_mask')
+
+        wave_tensor = torch.from_numpy(waveform).float()
+        mel_tensor = synthetic.get('mel')
+        if mel_tensor is None:
+            mel_tensor = self.to_melspec(wave_tensor)
+            mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
+        else:
+            mel_tensor = torch.from_numpy(mel_tensor).float()
+        mel_length = mel_tensor.size(1)
+
+        f0 = self.f0_extractor.align_length(f0, mel_length)
+        f0 = torch.from_numpy(f0).float()
+
+        if voiced is not None:
+            voiced = np.asarray(voiced, dtype=np.float32)
+            voiced = self.f0_extractor.align_length(voiced, mel_length)
+            is_silence = torch.from_numpy(1.0 - voiced).float()
+        else:
+            is_silence = torch.zeros_like(f0)
+            is_silence[f0 == 0] = 1.0
+
+        if mel_length > self.max_mel_length:
+            random_start = np.random.randint(0, mel_length - self.max_mel_length)
+            mel_tensor = mel_tensor[:, random_start:random_start + self.max_mel_length]
+            f0 = f0[random_start:random_start + self.max_mel_length]
+            is_silence = is_silence[random_start:random_start + self.max_mel_length]
+
+        return mel_tensor, f0, is_silence
+
 
     def __getitem__(self, idx):
-        data = self.data_list[idx]
-        mel_tensor, f0, is_silence = self.path_to_mel_and_label(data)
+        if idx < self.num_real_samples:
+            data = self.data_list[idx]
+            mel_tensor, f0, is_silence = self.path_to_mel_and_label(data)
+        else:
+            synthetic_index = idx - self.num_real_samples
+            mel_tensor, f0, is_silence = self._generate_synthetic_item(synthetic_index)
         return mel_tensor, f0, is_silence
 
     def _load_tensor(self, data):
@@ -312,8 +448,8 @@ class MelDataset(torch.utils.data.Dataset):
     def _mel_cache_paths(self, path):
         return path + self._mel_cache_suffix, path + self._mel_meta_suffix
 
-    def _load_cached_mel(self, path, expected_metadata):
-        if not self._cache_enabled or self.data_augmentation:
+    def _load_cached_mel(self, path, expected_metadata, allow_cache=True):
+        if not self._cache_enabled or self.data_augmentation or not allow_cache:
             return None
 
         mel_cache_path, meta_cache_path = self._mel_cache_paths(path)
