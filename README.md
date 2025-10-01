@@ -12,7 +12,16 @@ cd PitchExtractor
 ```bash
 pip install SoundFile torchaudio torch pyyaml click matplotlib librosa pyworld
 ```
-4. Prepare your own dataset and put the `train_list.txt` and `val_list.txt` in the `Data` folder (see Training section for more details).
+4. (Optional) Install extra dependencies for alternative F0 backends:
+
+   | Backend        | Installation command / notes |
+   | -------------- | ----------------------------- |
+   | TorchCrepe     | `pip install torchcrepe` |
+   | Praat / Parselmouth | `pip install praat-parselmouth` |
+
+   These packages are only needed when you enable the corresponding backend in `Configs/config.yml`. The training pipeline will gracefully skip any backend whose dependency is missing.
+
+5. Prepare your own dataset and put the `train_list.txt` and `val_list.txt` in the `Data` folder (see Training section for more details).
 
 ## Training
 ```bash
@@ -26,7 +35,17 @@ Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up trainin
 Since both `harvest` and `dio` are relatively slow, we do have to save the computed F0 ground truth for later use. In [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py#L77-L89), it will write the computed F0 curve `_f0.npy` for each `.wav` file. This requires write permission in your data folder. 
 
 ### F0 Computation Details
-In [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py#L83-L87), the F0 curves are computated using [PyWorld](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder), one with `harvest` and another with `dio`. Both methods are acoustic-based and are unstable under certain conditions. `harvest` is faster but fails more than `dio`, so we first try `harvest`. When `harvest` fails (determined by number of frames with non-zero values), it will compute the ground truth F0 labels with `dio`. If `dio` fails, the computed F0 will have `NaN` and will be replaced with 0. This is supposed to occur only occasionally and should not affect training because these samples are treated as noises by the neural network and deep learning models are kwown to even benefit from slightly noisy datasets. However, if a lot of your samples have this problem (say > 5%), please remove them from the training set so that the model does not learn from the failed samples. 
+`meldataset.MelDataset` now supports a cascade of runtime-selectable F0 backends. The default configuration uses PyWorld's `harvest` followed by `dio`, mirroring the original behaviour, but you can enable neural or classical trackers such as TorchCrepe (PyTorch CREPE) and Praat/Parselmouth by editing `dataset_params.f0_params` in [Configs/config.yml](Configs/config.yml). Backends are evaluated in the order defined by `backend_order`, and each backend may be toggled on/off or customised individually (for example, to adjust TorchCrepe's model size or Praat's pitch range).
+
+Whenever the backend configuration changes the dataset automatically regenerates cached pitch files under backend-specific filenames and stores a small JSON metadata file alongside each cache to keep track of the extractor that produced it. Failed extraction attempts fall back to the next enabled backend until a valid contour with sufficient voiced frames is produced. If all backends fail the sample is logged and the stored F0 is left empty (zeros after post-processing), so you may want to audit those cases if they occur frequently.
+
+#### Backend configuration summary
+
+- **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.
+- **TorchCrepe (CREPE)** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, constrain the search range via `fmin`/`fmax`, and tune batching (`batch_size`), padding, and optional `median_filter_size`. Enable `return_periodicity` to obtain confidence scores and zero out low-confidence frames with `periodicity_threshold`. `device` accepts `auto` (prefer CUDA) or an explicit torch device string such as `cpu`, `cuda`, or `cuda:1`. When any enabled backend requests CUDA the dataloader automatically switches to the `spawn` multiprocessing context so TorchCrepe can initialise GPUs inside worker processes; override this behaviour via `dataset_params.dataloader.start_method` if necessary.
+- **Praat / Parselmouth** – Set the `method` (e.g., `ac`, `cc`), `min_pitch`/`max_pitch` bounds, and adjust `silence_threshold` and `voicing_threshold` for sensitivity.
+
+The optional `dataset_params.dataloader` dictionary lets you fine-tune how the `DataLoader` is constructed (for example, setting `start_method`, `persistent_workers`, or `prefetch_factor`). When omitted the builder keeps PyTorch defaults, only forcing `start_method: spawn` when CUDA-enabled F0 backends would otherwise hit the "Cannot re-initialize CUDA in forked subprocess" error.
 
 ### Data Augmentation
 Data augmentation is not included in this code. For better voice conversion results, please add your own data augmentation in [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py) with [audiomentations](https://github.com/iver56/audiomentations).

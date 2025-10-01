@@ -22,4 +22,107 @@ dataset_params:
     n_fft: 1024
     n_mels: 80
     hop_length: 300
+  # Optional DataLoader overrides. Leave fields as null to accept the defaults.
+  # When left unspecified the loader automatically switches to ``start_method:
+  # spawn`` whenever a CUDA-enabled F0 backend is active so GPU extraction works
+  # inside worker processes without manual tuning.
+  dataloader:
+    start_method: null
+    persistent_workers: null
+    prefetch_factor: null
+  f0_params:
+    bad_f0_threshold: 5
+    zero_fill_value: 0.0
+    # Ordered list of backend names to try when computing F0. Each entry must
+    # match a key below in the ``backends`` dictionary and will be attempted in
+    # sequence until one produces a valid contour.
+    backend_order:
+      # PyWorld's Harvest tracker prioritises accuracy and can optionally fall
+      # back to a secondary algorithm (e.g. DIO) when it produces too few voiced
+      # frames for a clip.
+      - pyworld_harvest
+      # PyWorld's DIO tracker is faster than Harvest and is a common baseline.
+      - pyworld_dio
+      # CREPE is a neural-network F0 estimator that works well on singing voice
+      # and noisy material. Enable it when you have the dependency installed and
+      # want a data-driven approach.
+      - crepe
+      # Praat accesses the classic signal-processing F0 algorithms via the
+      # parselmouth bindings. The ``method`` parameter accepts values like
+      # "ac" (autocorrelation) or "cc" (cross-correlation).
+      - praat
+      # Native parselmouth backend mirroring Praat's algorithm selection.
+      - parselmouth
+    backends:
+      # Harvest configuration (PyWorld). Toggle ``enabled`` to include/exclude
+      # the backend. ``algorithm`` can be "harvest", "dio", or "stonemask".
+      # ``fallback`` specifies another PyWorld algorithm to try when the first
+      # run returns mostly unvoiced frames. ``stonemask`` enables the refinement
+      # pass after the main extraction.
+      pyworld_harvest:
+        type: pyworld
+        enabled: true
+        config:
+          algorithm: harvest
+          fallback: dio
+          stonemask: true
+      # DIO configuration (PyWorld). Set ``fallback`` to another algorithm name
+      # (or null to disable) and toggle ``stonemask`` for optional refinement.
+      pyworld_dio:
+        type: pyworld
+        enabled: true
+        config:
+          algorithm: dio
+          fallback: null
+          stonemask: true
+      # TorchCrepe neural F0 (PyTorch implementation of CREPE). ``model`` accepts
+      # "tiny", "small", "medium", or "full". ``step_size_ms`` controls the
+      # analysis hop in milliseconds. ``fmin``/``fmax`` bound the search range.
+      # ``batch_size`` controls GPU memory usage, ``pad``/``pad_mode`` mirror the
+      # torchcrepe API, and ``return_periodicity`` exposes per-frame confidence
+      # scores which can be thresholded via ``periodicity_threshold``. Set
+      # ``median_filter_size`` > 1 to apply optional smoothing. ``device`` accepts
+      # ``auto`` (prefer CUDA when available) or an explicit torch device string
+      # like ``cpu`` or ``cuda:0``.
+      crepe:
+        type: crepe
+        enabled: false
+        config:
+          model: full
+          step_size_ms: null
+          fmin: 50.0
+          fmax: 1100.0
+          batch_size: 1024
+          pad: true
+          pad_mode: reflect
+          return_periodicity: true
+          periodicity_threshold: 0.1
+          median_filter_size: 0
+          device: auto
+      # Praat backend via parselmouth. ``method`` matches Praat's choices such
+      # as "ac" (autocorrelation) or "cc" (cross-correlation). ``min_pitch`` and
+      # ``max_pitch`` set the allowed frequency range in Hertz. The
+      # ``silence_threshold`` and ``voicing_threshold`` values control
+      # voiced/unvoiced detection sensitivity.
+      praat:
+        type: praat
+        enabled: false
+        config:
+          method: ac
+          min_pitch: 40.0
+          max_pitch: 1100.0
+          silence_threshold: 0.03
+          voicing_threshold: 0.45
+      # Native parselmouth wrapper. Accepts the same ``method``/threshold
+      # options as Praat but can be configured independently if you want a
+      # different parameter set.
+      parselmouth:
+        type: parselmouth
+        enabled: false
+        config:
+          method: ac
+          min_pitch: 40.0
+          max_pitch: 1100.0
+          silence_threshold: 0.03
+          voicing_threshold: 0.45
   
