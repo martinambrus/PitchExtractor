@@ -21,8 +21,10 @@ from torch.utils import checkpoint
 
 try:
     from torch.amp import autocast as torch_autocast
+    from torch.amp import GradScaler as TorchGradScaler
 except (ImportError, AttributeError):
     torch_autocast = None
+    TorchGradScaler = None
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -58,7 +60,14 @@ class Trainer(object):
         self.logger = logger
         device_type = torch.device(self.device).type if isinstance(self.device, (str, torch.device)) else "cpu"
         self.use_amp = bool(use_mixed_precision and device_type == "cuda")
-        self.scaler = CudaGradScaler(enabled=self.use_amp)
+        if TorchGradScaler is not None:
+            self.scaler = TorchGradScaler(device_type=device_type, enabled=self.use_amp)
+            if self.use_amp:
+                self.logger.info("Using mixed precision scaling with torch.amp.GradScaler")
+        else:
+            self.scaler = CudaGradScaler(enabled=self.use_amp)
+            if self.use_amp:
+                self.logger.info("Using mixed precision scaling with torch.cuda.amp.GradScaler")
         if self.use_amp:
             if torch_autocast is not None:
                 def autocast_cm():
