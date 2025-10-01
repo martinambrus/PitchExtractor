@@ -16,8 +16,13 @@ import matplotlib.pyplot as plt
 
 import logging
 from contextlib import nullcontext
-from torch.cuda import amp
+from torch.cuda.amp import GradScaler as CudaGradScaler, autocast as cuda_autocast
 from torch.utils import checkpoint
+
+try:
+    from torch.amp import autocast as torch_autocast
+except (ImportError, AttributeError):
+    torch_autocast = None
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -53,12 +58,22 @@ class Trainer(object):
         self.logger = logger
         device_type = torch.device(self.device).type if isinstance(self.device, (str, torch.device)) else "cpu"
         self.use_amp = bool(use_mixed_precision and device_type == "cuda")
-        self.scaler = amp.GradScaler(enabled=self.use_amp)
+        self.scaler = CudaGradScaler(enabled=self.use_amp)
+        if self.use_amp:
+            if torch_autocast is not None:
+                def autocast_cm():
+                    return torch_autocast(device_type=device_type)
+
+                self.logger.info("Using mixed precision training with torch.amp.autocast")
+            else:
+                autocast_cm = cuda_autocast
+                self.logger.info("Using mixed precision training with torch.cuda.amp.autocast")
+        else:
+            autocast_cm = nullcontext
+        self._autocast_cm = autocast_cm
         self.gradient_checkpointing = bool(gradient_checkpointing and device_type == "cuda")
         if gradient_checkpointing and device_type != "cuda":
             self.logger.warning("Gradient checkpointing requested but CUDA is unavailable; disabling.")
-        if self.use_amp:
-            self.logger.info("Using mixed precision training with torch.cuda.amp")
         if self.gradient_checkpointing:
             self.logger.info("Gradient checkpointing enabled for training")
 
@@ -148,7 +163,7 @@ class Trainer(object):
         batch = [b.to(self.device, non_blocking=True) for b in batch]
 
         x, f0, sil = batch
-        autocast_context = amp.autocast if self.use_amp else nullcontext
+        autocast_context = self._autocast_cm
 
         with autocast_context():
             if self.gradient_checkpointing:
@@ -200,7 +215,7 @@ class Trainer(object):
             batch = [b.to(self.device, non_blocking=True) for b in batch]
             x, f0, sil = batch
 
-            autocast_context = amp.autocast if self.use_amp else nullcontext
+            autocast_context = self._autocast_cm
             with autocast_context():
                 f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
