@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 
-from f0_backends import BackendComputationError, build_f0_extractor
+from f0_backends import BackendComputationError, BackendResult, build_f0_extractor
 
 import logging
 logger = logging.getLogger(__name__)
@@ -80,6 +80,10 @@ class MelDataset(torch.utils.data.Dataset):
         self.requires_cuda_backend = getattr(self.f0_extractor, "requires_cuda", False)
         self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
         self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
+        self.voicing_cache_suffix = self.f0_cache_suffix.replace("_f0", "_voicing")
+        if self.voicing_cache_suffix == self.f0_cache_suffix:
+            base, ext = osp.splitext(self.f0_cache_suffix)
+            self.voicing_cache_suffix = f"{base}_voicing{ext}"
         if self.verbose:
             active_backends = self.f0_extractor.describe_backends()
             backend_summary = ', '.join(active_backends) if active_backends else 'none'
@@ -102,6 +106,9 @@ class MelDataset(torch.utils.data.Dataset):
         # for silence detection
         self.zero_value = float(self.f0_params.get('zero_fill_value', 0.0))
         self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
+        self.voicing_confidence_threshold = float(
+            self.f0_params.get('voicing_confidence_threshold', 0.5)
+        )
 
     def __len__(self):
         return len(self.data_list)
@@ -138,7 +145,14 @@ class MelDataset(torch.utils.data.Dataset):
         self.requires_cuda_backend = getattr(self.f0_extractor, 'requires_cuda', False)
         self.f0_cache_suffix = f"_f0{self.f0_extractor.cache_identifier}.npy"
         self.f0_meta_suffix = self.f0_cache_suffix.replace('.npy', '.json')
+        self.voicing_cache_suffix = self.f0_cache_suffix.replace("_f0", "_voicing")
+        if self.voicing_cache_suffix == self.f0_cache_suffix:
+            base, ext = osp.splitext(self.f0_cache_suffix)
+            self.voicing_cache_suffix = f"{base}_voicing{ext}"
         self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
+        self.voicing_confidence_threshold = float(
+            self.f0_params.get('voicing_confidence_threshold', 0.5)
+        )
 
     def path_to_mel_and_label(self, path):
         wave_tensor, wave_sr = self._load_tensor(path)
@@ -150,8 +164,10 @@ class MelDataset(torch.utils.data.Dataset):
             waveform = self._resample_waveform(waveform, wave_sr, self.sr)
             wave_sr = self.sr
 
-        f0 = self._load_or_compute_f0(path, waveform, wave_sr)
-        
+        backend_f0: BackendResult = self._load_or_compute_f0(path, waveform, wave_sr)
+        f0_values = backend_f0.f0
+        voicing_probability = backend_f0.voicing_probability
+
         if self.data_augmentation:
             random_scale = 0.5 + 0.5 * np.random.random()
             wave_tensor = random_scale * wave_tensor
@@ -166,16 +182,23 @@ class MelDataset(torch.utils.data.Dataset):
         mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
         mel_length = mel_tensor.size(1)
 
-        f0 = self.f0_extractor.align_length(f0, mel_length)
-        f0 = torch.from_numpy(f0).float()
+        f0_values = self.f0_extractor.align_length(f0_values, mel_length)
+        f0 = torch.from_numpy(f0_values).float()
 
-        f0_zero = (f0 == 0)
-        
+        voicing_tensor = None
+        if voicing_probability is not None and voicing_probability.size:
+            aligned_voicing = self.f0_extractor.align_length(voicing_probability, mel_length)
+            voicing_tensor = torch.from_numpy(aligned_voicing).float().clamp(0.0, 1.0)
+
         #######################################
         # You may want your own silence labels here
         # The more accurate the label, the better the resultss
-        is_silence = torch.zeros(f0.shape)
-        is_silence[f0_zero] = 1
+        if voicing_tensor is not None:
+            is_silence = (voicing_tensor < self.voicing_confidence_threshold).float()
+        else:
+            reference = torch.full_like(f0, self.zero_value)
+            zero_mask = torch.isclose(f0, reference, atol=1e-8)
+            is_silence = zero_mask.float()
         #######################################
         
         if mel_length > self.max_mel_length:
@@ -186,6 +209,12 @@ class MelDataset(torch.utils.data.Dataset):
         
         if torch.any(torch.isnan(f0)): # failed
             f0[torch.isnan(f0)] = self.zero_value # replace nan value with 0
+        if voicing_tensor is not None and torch.any(torch.isnan(voicing_tensor)):
+            voicing_tensor = torch.where(
+                torch.isnan(voicing_tensor),
+                torch.zeros_like(voicing_tensor),
+                voicing_tensor,
+            )
 
         return mel_tensor, f0, is_silence
 
@@ -205,10 +234,11 @@ class MelDataset(torch.utils.data.Dataset):
         data_path = path + self.f0_cache_suffix
         meta_path = path + self.f0_meta_suffix
         legacy_path = path + "_f0.npy"
-        return data_path, meta_path, legacy_path
+        voicing_path = path + self.voicing_cache_suffix
+        return data_path, meta_path, legacy_path, voicing_path
 
     def _load_or_compute_f0(self, path, waveform, sr):
-        data_path, meta_path, legacy_path = self._f0_cache_paths(path)
+        data_path, meta_path, legacy_path, voicing_path = self._f0_cache_paths(path)
 
         # attempt to load cached F0 with metadata validation
         if os.path.isfile(data_path):
@@ -228,18 +258,35 @@ class MelDataset(torch.utils.data.Dataset):
                 }
                 if all(metadata.get(key) == value for key, value in expected.items()):
                     try:
-                        return np.load(data_path)
+                        f0 = np.load(data_path)
+                        voicing = None
+                        if os.path.isfile(voicing_path):
+                            try:
+                                voicing = np.load(voicing_path)
+                            except (OSError, ValueError):
+                                self._remove_file_safely(voicing_path)
+                                voicing = None
+                        backend_name = str(metadata.get('backend', ''))
+                        return BackendResult(
+                            f0=f0,
+                            backend_name=backend_name,
+                            voicing_probability=voicing,
+                        )
                     except (OSError, ValueError):
                         self._remove_file_safely(data_path)
+                        self._remove_file_safely(voicing_path)
                 else:
                     self._remove_file_safely(data_path)
                     self._remove_file_safely(meta_path)
+                    self._remove_file_safely(voicing_path)
             else:
                 self._remove_file_safely(data_path)
+                self._remove_file_safely(voicing_path)
 
         if os.path.isfile(legacy_path):
             try:
-                return np.load(legacy_path)
+                f0 = np.load(legacy_path)
+                return BackendResult(f0=f0, backend_name="")
             except (OSError, ValueError):
                 self._remove_file_safely(legacy_path)
 
@@ -250,32 +297,41 @@ class MelDataset(torch.utils.data.Dataset):
 
         try:
             result = self.f0_extractor.compute(waveform, sr=sr)
-            f0 = result.f0
             backend_name = result.backend_name
             if self.verbose and backend_name:
                 print(f"[MelDataset] Selected F0 backend '{backend_name}' for {path}")
         except BackendComputationError as exc:
             logger.warning("All configured F0 backends failed for %s: %s", path, exc)
-            f0 = np.zeros((0,), dtype=np.float32)
-            backend_name = ""
+            result = BackendResult(f0=np.zeros((0,), dtype=np.float32), backend_name="")
             if self.verbose:
                 print(f"[MelDataset] F0 computation failed for {path}; using zeros")
+
+        f0 = np.asarray(result.f0, dtype=np.float32)
+        voicing = None
+        if result.voicing_probability is not None:
+            voicing = np.asarray(result.voicing_probability, dtype=np.float32)
+        backend_name = result.backend_name
 
         if self._cache_enabled and not self.data_augmentation:
             try:
                 np.save(data_path, f0)
+                if voicing is not None and voicing.size:
+                    np.save(voicing_path, voicing)
+                else:
+                    self._remove_file_safely(voicing_path)
                 metadata = {
                     'cache_identifier': self.f0_extractor.cache_identifier,
                     'backend': backend_name,
                     'sample_rate': int(self.sr),
                     'hop_length': int(self.mel_params['hop_length']),
+                    'has_voicing': bool(voicing is not None and voicing.size),
                 }
                 with open(meta_path, 'w', encoding='utf-8') as meta_file:
                     json.dump(metadata, meta_file, sort_keys=True)
             except OSError as exc:
                 logger.warning("Failed to cache F0 for %s: %s", path, exc)
 
-        return f0
+        return BackendResult(f0=f0, backend_name=backend_name, voicing_probability=voicing)
 
     @staticmethod
     def _resample_waveform(waveform, source_sr, target_sr):
@@ -362,18 +418,22 @@ class MelDataset(torch.utils.data.Dataset):
 
         for audio_path in self.data_list:
             mel_cache_path, meta_cache_path = self._mel_cache_paths(audio_path)
-            f0_cache_path, f0_meta_path, legacy_path = self._f0_cache_paths(audio_path)
+            f0_cache_path, f0_meta_path, legacy_path, voicing_path = self._f0_cache_paths(audio_path)
             self._remove_file_safely(mel_cache_path)
             self._remove_file_safely(meta_cache_path)
             self._remove_file_safely(f0_cache_path)
             self._remove_file_safely(f0_meta_path)
             self._remove_file_safely(legacy_path)
+            self._remove_file_safely(voicing_path)
             for extra_path in glob.glob(audio_path + "_f0*.npy"):
                 if extra_path not in {f0_cache_path, legacy_path}:
                     self._remove_file_safely(extra_path)
             for extra_meta in glob.glob(audio_path + "_f0*.json"):
                 if extra_meta != f0_meta_path:
                     self._remove_file_safely(extra_meta)
+            for extra_voicing in glob.glob(audio_path + "_voicing*.npy"):
+                if extra_voicing != voicing_path:
+                    self._remove_file_safely(extra_voicing)
 
     @staticmethod
     def _remove_file_safely(path):

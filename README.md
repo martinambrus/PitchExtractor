@@ -43,6 +43,8 @@ Since both `harvest` and `dio` are relatively slow, we do have to save the compu
 
 Whenever the backend configuration changes the dataset automatically regenerates cached pitch files under backend-specific filenames and stores a small JSON metadata file alongside each cache to keep track of the extractor that produced it. Failed extraction attempts fall back to the next enabled backend until a valid contour with sufficient voiced frames is produced. If all backends fail the sample is logged and the stored F0 is left empty (zeros after post-processing), so you may want to audit those cases if they occur frequently.
 
+Each extractor now returns a per-frame voicing probability in addition to the F0 contour, mirroring confidence-style outputs from trackers such as SPICE. These probabilities are cached alongside the pitch curves, exposed through `BackendResult.voicing_probability`, and consumed by `MelDataset` via the configurable `voicing_confidence_threshold` (see `dataset_params.f0_params`). This allows downstream tasks to adjust voiced/unvoiced decisions without re-running the pitch tracker and to incorporate confidence-aware loss weighting if desired.
+
 #### Backend configuration summary
 
 - **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.

@@ -37,8 +37,11 @@ class BackendComputationError(RuntimeError):
 
 @dataclasses.dataclass
 class BackendResult:
+    """Container for F0 trajectories and associated metadata."""
+
     f0: np.ndarray
-    backend_name: str
+    backend_name: str = ""
+    voicing_probability: Optional[np.ndarray] = None
     details: Optional[str] = None
 
 
@@ -102,7 +105,9 @@ class BaseF0Backend:
 
     # ------------------------------------------------------------------
     # API surface expected from subclasses
-    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:  # pragma: no cover - abstract
+    def compute(
+        self, audio: np.ndarray, sr: Optional[int] = None
+    ) -> BackendResult:  # pragma: no cover - abstract
         raise NotImplementedError
 
 
@@ -133,7 +138,7 @@ class PyWorldBackend(BaseF0Backend):
             return self._pw.stonemask(audio, f0, t, sr), t
         raise ValueError(f"Unsupported PyWorld algorithm: {algorithm}")
 
-    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
+    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> BackendResult:
         sr = int(sr or self.sample_rate)
         signal = audio.astype("double", copy=False)
         algorithm = self.algorithm
@@ -145,7 +150,9 @@ class PyWorldBackend(BaseF0Backend):
             f0, t = self._run_algorithm(self.fallback_algorithm, signal, sr)
         if self.use_stonemask and algorithm != "stonemask":
             f0 = self._pw.stonemask(signal, f0, t, sr)
-        return f0.astype(np.float64)
+        f0 = f0.astype(np.float64)
+        voicing_probability = (f0 > 0.0).astype(np.float64)
+        return BackendResult(f0=f0, voicing_probability=voicing_probability)
 
 
 class CrepeBackend(BaseF0Backend):
@@ -269,7 +276,7 @@ class CrepeBackend(BaseF0Backend):
         self.requires_cuda = False
         return True
 
-    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
+    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> BackendResult:
         sr = int(sr or self.sample_rate)
         waveform = audio.astype(np.float32, copy=False)
         if waveform.ndim != 1:
@@ -346,7 +353,13 @@ class CrepeBackend(BaseF0Backend):
             % (f0.shape[0], self._device.type, mean_conf)
         )
 
-        return f0
+        voicing_probability: Optional[np.ndarray]
+        if confidence is not None:
+            voicing_probability = np.clip(confidence.astype(np.float64), 0.0, 1.0)
+        else:
+            voicing_probability = (f0 > 0.0).astype(np.float64)
+
+        return BackendResult(f0=f0, voicing_probability=voicing_probability)
 
 
 class SwiftF0Backend(BaseF0Backend):
@@ -404,7 +417,7 @@ class SwiftF0Backend(BaseF0Backend):
             ) from exc
         self.requires_cuda = False
 
-    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
+    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> BackendResult:
         sr = int(sr or self.sample_rate)
         waveform = np.asarray(audio, dtype=np.float32)
         if waveform.ndim != 1:
@@ -422,7 +435,8 @@ class SwiftF0Backend(BaseF0Backend):
             raise BackendComputationError(f"SwiftF0 failed to compute F0: {exc}") from exc
 
         f0 = np.asarray(result.pitch_hz, dtype=np.float64)
-        mean_conf = float(np.mean(result.confidence)) if result.confidence.size else 0.0
+        confidence = np.asarray(result.confidence, dtype=np.float64)
+        mean_conf = float(np.mean(confidence)) if confidence.size else 0.0
         self.log(f"SwiftF0 analysed {f0.size} frames with mean confidence {mean_conf:.3f}.")
 
         if self.zero_unvoiced:
@@ -430,8 +444,12 @@ class SwiftF0Backend(BaseF0Backend):
             if voicing.size:
                 f0 = f0.copy()
                 f0[~voicing] = self.unvoiced_value
+        if confidence.size:
+            voicing_probability = np.clip(confidence, 0.0, 1.0)
+        else:
+            voicing_probability = (f0 > 0.0).astype(np.float64)
 
-        return f0
+        return BackendResult(f0=f0, voicing_probability=voicing_probability)
 
 
 class PraatBackend(BaseF0Backend):
@@ -491,7 +509,7 @@ class PraatBackend(BaseF0Backend):
                 return candidate
         return None
 
-    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
+    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> BackendResult:
         sr = int(sr or self.sample_rate)
         sound = self._parselmouth.Sound(audio, sampling_frequency=sr)
         time_step = self.frame_period_ms / 1000.0
@@ -531,6 +549,20 @@ class PraatBackend(BaseF0Backend):
                 kwargs["method"] = method_enum
             pitch = sound.to_pitch(**kwargs)
         selected = pitch.selected_array
+        voicing_probability: Optional[np.ndarray] = None
+        try:
+            strength = np.asarray(selected["strength"], dtype=np.float64)
+            if strength.size:
+                voicing_probability = np.clip(strength, 0.0, 1.0)
+        except Exception:  # pragma: no cover - optional field
+            voicing_probability = None
+        if voicing_probability is None:
+            try:
+                voiced = np.asarray(selected["voiced"], dtype=np.float64)
+                if voiced.size:
+                    voicing_probability = np.clip(voiced, 0.0, 1.0)
+            except Exception:  # pragma: no cover - optional field
+                voicing_probability = None
         unit_key = self.pitch_unit or "Hertz"
         candidate_keys: List[str] = []
         if isinstance(unit_key, str):
@@ -552,30 +584,38 @@ class PraatBackend(BaseF0Backend):
         candidate_keys = [key for key in candidate_keys if not (key in seen or seen.add(key))]
 
         last_error: Optional[Exception] = None
+        frequency: Optional[np.ndarray] = None
         for key in candidate_keys:
             try:
                 values = selected[key]
-                return np.asarray(values, dtype=np.float64)
+                frequency = np.asarray(values, dtype=np.float64)
+                break
             except Exception as exc:  # pragma: no cover - passthrough for unexpected APIs
                 last_error = exc
                 continue
 
-        available: List[str] = []
-        if hasattr(selected, "keys"):
-            try:
-                available = list(selected.keys())  # type: ignore[assignment]
-            except Exception:  # pragma: no cover - defensive
-                available = []
-        dtype = getattr(selected, "dtype", None)
-        if not available and getattr(dtype, "names", None):
-            available = list(dtype.names)
+        if frequency is None:
+            available: List[str] = []
+            if hasattr(selected, "keys"):
+                try:
+                    available = list(selected.keys())  # type: ignore[assignment]
+                except Exception:  # pragma: no cover - defensive
+                    available = []
+            dtype = getattr(selected, "dtype", None)
+            if not available and getattr(dtype, "names", None):
+                available = list(dtype.names)
 
-        detail = (
-            f"Available fields: {available!r}. Last error: {last_error}" if available or last_error else ""
-        )
-        raise ValueError(
-            f"Unsupported Praat pitch unit '{self.pitch_unit}'. {detail}"
-        )
+            detail = (
+                f"Available fields: {available!r}. Last error: {last_error}" if available or last_error else ""
+            )
+            raise ValueError(
+                f"Unsupported Praat pitch unit '{self.pitch_unit}'. {detail}"
+            )
+
+        if voicing_probability is None:
+            voicing_probability = (frequency > 0.0).astype(np.float64)
+
+        return BackendResult(f0=frequency, voicing_probability=voicing_probability)
 
 
 class ParselmouthBackend(PraatBackend):
@@ -762,7 +802,7 @@ class F0Extractor:
         sr = int(sr or self.sample_rate)
         for backend in self.backends:
             try:
-                f0 = backend.compute(audio, sr)
+                backend_result = backend.compute(audio, sr)
             except BackendUnavailableError as exc:
                 LOGGER.warning("Backend '%s' became unavailable: %s", backend.name, exc)
                 continue
@@ -770,9 +810,27 @@ class F0Extractor:
                 LOGGER.exception("Backend '%s' failed with error", backend.name)
                 continue
 
-            if f0 is None:
+            if backend_result is None:
                 continue
-            f0 = np.asarray(f0, dtype=np.float64)
+            if not isinstance(backend_result, BackendResult):
+                f0_array = np.asarray(backend_result, dtype=np.float64)
+                backend_result = BackendResult(f0=f0_array)
+
+            f0 = np.asarray(backend_result.f0, dtype=np.float64)
+            backend_result.f0 = f0
+            if backend_result.voicing_probability is not None:
+                prob = np.asarray(backend_result.voicing_probability, dtype=np.float64)
+                if prob.shape != f0.shape:
+                    if prob.size == f0.size:
+                        backend_result.voicing_probability = prob.reshape(f0.shape)
+                    else:
+                        LOGGER.warning(
+                            "Backend '%s' returned voicing probabilities with mismatched shape; discarding.",
+                            backend.name,
+                        )
+                        backend_result.voicing_probability = None
+                else:
+                    backend_result.voicing_probability = prob
             if np.count_nonzero(f0) < self.bad_f0_threshold:
                 LOGGER.warning(
                     "Backend '%s' returned only %d voiced frames; attempting next backend.",
@@ -780,7 +838,8 @@ class F0Extractor:
                     int(np.count_nonzero(f0)),
                 )
                 continue
-            return BackendResult(f0=f0, backend_name=backend.name)
+            backend_result.backend_name = backend.name
+            return backend_result
 
         raise BackendComputationError("All configured F0 backends failed to produce a valid contour.")
 

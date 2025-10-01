@@ -24,6 +24,7 @@ from f0_backends import BackendComputationError, BackendResult, build_f0_extract
 class NotebookF0Result:
     f0: np.ndarray
     backend_name: str
+    voicing_probability: Optional[np.ndarray] = None
 
 
 def load_training_config(config_path: Optional[Path]) -> Dict[str, Any]:
@@ -93,16 +94,28 @@ def compute_f0_for_notebook(
         result: BackendResult = extractor.compute(waveform, sr=sr)
         f0 = result.f0
         backend_name = result.backend_name
+        voicing_probability = result.voicing_probability
     except BackendComputationError as exc:
         f0 = np.zeros((0,), dtype=np.float32)
         backend_name = ""
+        voicing_probability = None
         print(f"Warning: all F0 backends failed ({exc}). Returning zeros.")
 
     if target_frames is not None:
         f0 = extractor.align_length(f0, target_frames)
+        if voicing_probability is not None:
+            voicing_probability = extractor.align_length(voicing_probability, target_frames)
 
     if np.any(np.isnan(f0)):
         f0 = np.nan_to_num(f0, nan=zero_fill_value)
+    if voicing_probability is not None and np.any(np.isnan(voicing_probability)):
+        voicing_probability = np.nan_to_num(voicing_probability, nan=0.0)
 
-    return NotebookF0Result(f0=f0.astype(np.float32), backend_name=backend_name)
+    vp_array = voicing_probability.astype(np.float32) if voicing_probability is not None else None
+
+    return NotebookF0Result(
+        f0=f0.astype(np.float32),
+        backend_name=backend_name,
+        voicing_probability=vp_array,
+    )
 
