@@ -413,6 +413,8 @@ class ConformerPitchNet(nn.Module):
             nn.SiLU(),
         )
 
+        self.d_model = d_model
+        self.encoder_input_proj: Optional[nn.Linear] = None
         self.positional_encoding = PositionalEncoding(d_model, dropout)
         self.encoder = ConformerEncoder(
             num_layers=num_layers,
@@ -461,7 +463,22 @@ class ConformerPitchNet(nn.Module):
 
         features = self.frontend(x)
         features = self.projection(features)
-        features = features.mean(dim=-1).transpose(1, 2)  # (B, T, d_model)
+        # Collapse the convolutional channel and frequency dimensions into a
+        # per-frame feature vector before feeding the sequence through the
+        # attention stack. ``flatten`` keeps the temporal axis intact so padded
+        # mask positions continue to line up with the encoder input.
+        features = features.permute(0, 2, 1, 3).contiguous().flatten(2)
+
+        if self.encoder_input_proj is None:
+            in_dim = features.size(-1)
+            self.encoder_input_proj = nn.Linear(in_dim, self.d_model).to(
+                device=features.device, dtype=features.dtype
+            )
+            nn.init.xavier_uniform_(self.encoder_input_proj.weight)
+            if self.encoder_input_proj.bias is not None:
+                nn.init.zeros_(self.encoder_input_proj.bias)
+
+        features = self.encoder_input_proj(features)
 
         features = self.positional_encoding(features)
         encoded = self.encoder(features, key_padding_mask=mask)
