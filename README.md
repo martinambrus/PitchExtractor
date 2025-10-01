@@ -43,6 +43,10 @@ Since both `harvest` and `dio` are relatively slow, we do have to save the compu
 
 Whenever the backend configuration changes the dataset automatically regenerates cached pitch files under backend-specific filenames and stores a small JSON metadata file alongside each cache to keep track of the extractor that produced it. Failed extraction attempts fall back to the next enabled backend until a valid contour with sufficient voiced frames is produced. If all backends fail the sample is logged and the stored F0 is left empty (zeros after post-processing), so you may want to audit those cases if they occur frequently.
 
+#### Post-processing for temporal smoothness
+
+In addition to the temporal models inside the neural network you can now apply optional smoothing to the cached F0 curves. Set `dataset_params.f0_params.postprocessing` in [`Configs/config.yml`](Configs/config.yml) to enable either a median filter (`median_filter.size`) or a lightweight Viterbi decoder (`viterbi.enabled`) that penalises large semitone jumps across contiguous voiced regions. These steps help reduce octave flips, jitter, and other unnatural transitions while preserving unvoiced regions. Both stages run after any backend finishes computing the raw contour, so you can mix and match them independently of the chosen extractor.
+
 #### Backend configuration summary
 
 - **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.

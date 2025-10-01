@@ -23,6 +23,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:  # pragma: no cover - optional dependency based on numpy version
+    from numpy.lib.stride_tricks import sliding_window_view
+except Exception:  # pragma: no cover - fallback for older numpy
+    sliding_window_view = None
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -757,6 +762,26 @@ class F0Extractor:
         self.cache_identifier = "-" + "_".join(cache_tag_components) if cache_tag_components else ""
         self.requires_cuda = any(getattr(backend, "requires_cuda", False) for backend in self.backends)
 
+        post_cfg = config.get("postprocessing") if config else None
+        self._postprocess_steps: List[str] = []
+        if isinstance(post_cfg, dict):
+            self._postprocess_median = self._parse_median_cfg(post_cfg.get("median_filter"))
+            if self._postprocess_median is not None:
+                self._postprocess_steps.append(
+                    f"median(window={self._postprocess_median})"
+                )
+            self._postprocess_viterbi = self._parse_viterbi_cfg(post_cfg.get("viterbi"))
+            if self._postprocess_viterbi is not None:
+                summary = (
+                    "viterbi"
+                    f"(step={self._postprocess_viterbi['semitone_step']},"
+                    f" penalty={self._postprocess_viterbi['transition_penalty']})"
+                )
+                self._postprocess_steps.append(summary)
+        else:
+            self._postprocess_median = None
+            self._postprocess_viterbi = None
+
     # ------------------------------------------------------------------
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> BackendResult:
         sr = int(sr or self.sample_rate)
@@ -780,7 +805,13 @@ class F0Extractor:
                     int(np.count_nonzero(f0)),
                 )
                 continue
-            return BackendResult(f0=f0, backend_name=backend.name)
+            details: Optional[str] = None
+            if self._postprocess_steps:
+                processed = self._apply_postprocessing(f0)
+                if processed is not None:
+                    f0 = processed
+                    details = ", ".join(self._postprocess_steps) if self._postprocess_steps else None
+            return BackendResult(f0=f0, backend_name=backend.name, details=details)
 
         raise BackendComputationError("All configured F0 backends failed to produce a valid contour.")
 
@@ -812,6 +843,173 @@ class F0Extractor:
     # ------------------------------------------------------------------
     def describe_skipped_backends(self) -> List[str]:
         return list(self._skipped_backends)
+
+    # ------------------------------------------------------------------
+    def _parse_median_cfg(self, cfg) -> Optional[int]:
+        if cfg is None:
+            return None
+        if isinstance(cfg, dict):
+            enabled = cfg.get("enabled", True)
+            size = cfg.get("size", cfg.get("window", 0))
+        else:
+            enabled = bool(cfg)
+            size = cfg
+        try:
+            window = int(size)
+        except (TypeError, ValueError):
+            raise ValueError("Median filter size must be an integer")
+        if window <= 1 or not enabled:
+            return None
+        if window % 2 == 0:
+            window += 1
+        if window < 3:
+            window = 3
+        return window
+
+    # ------------------------------------------------------------------
+    def _parse_viterbi_cfg(self, cfg) -> Optional[Dict[str, float]]:
+        if cfg is None:
+            return None
+        if isinstance(cfg, dict):
+            enabled = cfg.get("enabled", True)
+            params = cfg
+        else:
+            enabled = bool(cfg)
+            params = {}
+        if not enabled:
+            return None
+        def _float(name: str, default: float) -> float:
+            value = params.get(name, default)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid value for Viterbi parameter '{name}': {value!r}")
+
+        return {
+            "semitone_step": max(0.1, _float("semitone_step", 1.0)),
+            "transition_penalty": max(0.0, _float("transition_penalty", 0.5)),
+            "observation_weight": max(1e-6, _float("observation_weight", 1.0)),
+            "state_margin": max(0.0, _float("state_margin", 2.0)),
+        }
+
+    # ------------------------------------------------------------------
+    def _apply_postprocessing(self, f0: np.ndarray) -> Optional[np.ndarray]:
+        values = np.asarray(f0, dtype=np.float64)
+        modified = False
+
+        if self._postprocess_median is not None:
+            values = self._median_filter(values, self._postprocess_median)
+            modified = True
+
+        if self._postprocess_viterbi is not None:
+            values = self._viterbi_smooth(values, self._postprocess_viterbi)
+            modified = True
+
+        return values if modified else None
+
+    # ------------------------------------------------------------------
+    def _median_filter(self, values: np.ndarray, window: int) -> np.ndarray:
+        if window <= 1:
+            return values
+        pad = window // 2
+        voiced_mask = values > 0.0
+        if not np.any(voiced_mask):
+            return values
+
+        working = values.copy()
+        working[~voiced_mask] = np.nan
+
+        if sliding_window_view is not None:
+            padded = np.pad(working, (pad, pad), mode="edge")
+            windows = sliding_window_view(padded, window)
+            medians = np.nanmedian(windows, axis=-1)
+        else:  # pragma: no cover - fallback path
+            padded = np.pad(working, (pad, pad), mode="edge")
+            medians = np.empty_like(values)
+            for idx in range(values.size):
+                segment = padded[idx : idx + window]
+                medians[idx] = np.nanmedian(segment)
+
+        filtered = values.copy()
+        filtered[voiced_mask] = np.nan_to_num(medians[voiced_mask], nan=0.0)
+        return filtered
+
+    # ------------------------------------------------------------------
+    def _viterbi_smooth(self, values: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+        semitone_step = params["semitone_step"]
+        transition_penalty = params["transition_penalty"]
+        observation_weight = params["observation_weight"]
+        state_margin = params["state_margin"]
+
+        result = values.copy()
+        n = len(values)
+        if n <= 1:
+            return result
+
+        def hz_to_midi(freq: np.ndarray) -> np.ndarray:
+            return 69.0 + 12.0 * np.log2(freq / 440.0)
+
+        def midi_to_hz(midi_vals: np.ndarray) -> np.ndarray:
+            return 440.0 * np.power(2.0, (midi_vals - 69.0) / 12.0)
+
+        start = 0
+        while start < n:
+            while start < n and result[start] <= 0.0:
+                start += 1
+            if start >= n:
+                break
+            end = start
+            while end < n and result[end] > 0.0:
+                end += 1
+
+            segment = result[start:end]
+            if segment.size < 2:
+                start = end
+                continue
+
+            midi_obs = hz_to_midi(segment)
+            min_state = midi_obs.min() - state_margin
+            max_state = midi_obs.max() + state_margin
+            if not np.isfinite(min_state) or not np.isfinite(max_state):
+                start = end
+                continue
+            if max_state <= min_state:
+                start = end
+                continue
+
+            num_states = int(np.floor((max_state - min_state) / semitone_step)) + 1
+            if num_states < 2 or num_states > 512:  # guard against extreme ranges
+                start = end
+                continue
+            states = min_state + np.arange(num_states) * semitone_step
+
+            transition_cost = transition_penalty * (states[:, None] - states[None, :]) ** 2
+
+            T = segment.size
+            dp = np.empty((T, num_states))
+            backtrack = np.zeros((T, num_states), dtype=np.int32)
+
+            emission = observation_weight * (midi_obs[0] - states) ** 2
+            dp[0] = emission
+
+            for t in range(1, T):
+                emission = observation_weight * (midi_obs[t] - states) ** 2
+                prev_cost = dp[t - 1][:, None] + transition_cost
+                backtrack[t] = np.argmin(prev_cost, axis=0)
+                dp[t] = np.min(prev_cost, axis=0) + emission
+
+            best_last = int(np.argmin(dp[-1]))
+            path = np.zeros(T, dtype=np.int32)
+            path[-1] = best_last
+            for t in range(T - 1, 0, -1):
+                path[t - 1] = backtrack[t, path[t]]
+
+            smoothed = midi_to_hz(states[path])
+            result[start:end] = smoothed
+
+            start = end
+
+        return result
 
 
 def build_f0_extractor(
