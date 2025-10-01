@@ -265,13 +265,6 @@ class MelDataset(torch.utils.data.Dataset):
             try:
                 mel_tensor, f0, is_silence = self.path_to_mel_and_label(data)
             except (FileNotFoundError, LibsndfileError, RuntimeError, OSError, ValueError) as exc:
-                self._mark_path_invalid(data, exc)
-                attempts += 1
-                continue
-
-            return mel_tensor, f0, is_silence
-
-        raise RuntimeError("No valid audio files could be loaded from the dataset")
 
     def _mark_path_invalid(self, path, exc):
         if path in self._invalid_paths:
