@@ -8,6 +8,16 @@ train_data: "Data/train_list.txt"
 val_data: "Data/val_list.txt"
 num_workers: 16
 
+model:
+  name: conformer
+  d_model: 256
+  num_layers: 6
+  num_heads: 4
+  ff_multiplier: 4.0
+  conv_kernel_size: 31
+  dropout: 0.1
+  final_dropout: 0.1
+
   
 optimizer_params:
   lr: 0.0003

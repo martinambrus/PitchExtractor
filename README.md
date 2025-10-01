@@ -29,7 +29,14 @@ python train.py --config_path ./Configs/config.yml
 ```
 Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|anything`, see [train_list.txt](https://github.com/yl4579/StarGANv2-VC/blob/main/Data/train_list.txt) as an example (a subset of VCTK). Note that you can put anything after the filename because the training labels are generated ad-hoc.
 
-Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take. 
+Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take.
+
+### Model configuration
+The default model configuration now instantiates a Conformer-based backbone that blends self-attention with depthwise separable
+convolutions for improved temporal modelling compared to the legacy JDCNet reimplementation. You can tune the encoder width,
+number of layers/heads, and convolution kernel in the `model` section of [`Configs/config.yml`](Configs/config.yml). To reproduce
+the original JDCNet behaviour, set `model.name` to `jdcnet` and supply any required keyword arguments documented in
+[`model.py`](model.py).
 
 ### IMPORTANT: DATA FOLDER NEEDS WRITE PERMISSION
 Since both `harvest` and `dio` are relatively slow, we do have to save the computed F0 ground truth for later use. In [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py#L77-L89), it will write the computed F0 curve `_f0.npy` for each `.wav` file. This requires write permission in your data folder. 

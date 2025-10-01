@@ -1,4 +1,4 @@
-from model import JDCNet
+from model import build_model
 from meldataset import build_dataloader
 from optimizers import build_optimizer
 from trainer import Trainer
@@ -81,8 +81,13 @@ def main(config_path):
                                       device=device,
                                       dataset_config=config.get('dataset_params', {}))
 
-    # define model
-    model = JDCNet(num_class=1) # num_class = 1 means regression
+    dataset_config = config.get('dataset_params', {})
+    mel_params = dataset_config.get('mel_params', {})
+    inferred_mels = mel_params.get('n_mels', 80)
+
+    model_config = config.get('model', {}) or {}
+    model_config.setdefault('input_dim', inferred_mels)
+    model = build_model(model_config)
 
     scheduler_params = {
             "max_lr": float(config['optimizer_params'].get('lr', 5e-4)),
