@@ -301,8 +301,7 @@ class MelDataset(torch.utils.data.Dataset):
             return self._generate_synthetic_sample()
 
         data = self.data_list[idx]
-        mel_tensor, f0, is_silence = self.path_to_mel_and_label(data)
-        return mel_tensor, f0, is_silence
+        return self.path_to_mel_and_label(data)
 
     def _load_tensor(self, data, start_frame=None, num_frames=None):
         wave_path = data
