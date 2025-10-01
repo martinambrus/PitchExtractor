@@ -55,6 +55,32 @@ The optional `dataset_params.dataloader` dictionary lets you fine-tune how the `
 ### Data Augmentation
 Data augmentation is not included in this code. For better voice conversion results, please add your own data augmentation in [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py) with [audiomentations](https://github.com/iver56/audiomentations).
 
+### Synthetic pitch-calibrated data
+The dataloader can optionally blend in synthetic utterances whose pitch is known
+exactly. Enable the `dataset_params.synthetic_data` section in
+[Configs/config.yml](Configs/config.yml) to either pitch-shift existing clips or
+render fresh vowel-like speech with the WORLD vocoder. Synthetic data is
+especially useful for calibrating the regression head: even a small proportion
+of perfectly labelled samples nudges the model towards the correct absolute
+frequency scale (a trick popularised by Google's SwiftF0 training recipe).
+
+Two strategies are available:
+
+1. **Pitch shifting real audio** – Requires `librosa`. The loader draws random
+   files from the training list, applies semitone offsets, and scales the
+   cached F0 trajectory analytically. Adjust the `semitones`,
+   `gain_db_range`, and `min_voiced_fraction` parameters to control how
+   aggressive the augmentation should be.
+2. **WORLD vocoder synthesis** – Requires `pyworld`. The synthesiser generates
+   short vowel snippets with controllable duration, pitch range, vibrato, and
+   energy. Because the excitation contour is specified up-front, the ground
+   truth F0 is exact. Tune the `duration`, `pitch_range`, `gain_db_range`, and
+   `modulation` blocks to match your dataset.
+
+Synthetic examples are only added to the training split by default. Set
+`apply_to_validation: true` if you also want the validation loader to include
+them (for instance, when building dedicated calibration subsets).
+
 ## References
 - [keums/melodyExtraction_JDC](https://github.com/keums/melodyExtraction_JDC)
 - [kan-bayashi/ParallelWaveGAN](https://github.com/kan-bayashi/ParallelWaveGAN)

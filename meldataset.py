@@ -13,6 +13,13 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 
+try:
+    import librosa
+except ImportError:  # pragma: no cover - optional dependency
+    librosa = None
+
+from Utils.synthetic import WorldSynthesizer
+
 from f0_backends import BackendComputationError, build_f0_extractor
 
 import logging
@@ -38,7 +45,8 @@ class MelDataset(torch.utils.data.Dataset):
                  f0_params=None,
                  data_augmentation=False,
                  validation=False,
-                 verbose=True
+                 verbose=True,
+                 synthetic_data=None,
                  ):
 
         self.verbose = verbose
@@ -103,8 +111,29 @@ class MelDataset(torch.utils.data.Dataset):
         self.zero_value = float(self.f0_params.get('zero_fill_value', 0.0))
         self.bad_F0 = int(self.f0_params.get('bad_f0_threshold', self.f0_extractor.bad_f0_threshold))
 
+        # synthetic augmentation configuration
+        self._base_length = len(self.data_list)
+        self.synthetic_config = synthetic_data or {}
+        self.synthetic_enabled = bool(self.synthetic_config.get('enabled', False))
+        self.synthetic_apply_to_validation = bool(self.synthetic_config.get('apply_to_validation', False))
+        if validation and not self.synthetic_apply_to_validation:
+            self.synthetic_enabled = False
+        self._synthetic_generators = []
+        self._synthetic_count = 0
+        self._world_synthesizer = None
+        if self.synthetic_enabled:
+            self._initialise_synthetic_generators()
+        if self.verbose and self.synthetic_enabled:
+            summary = {
+                'count': self._synthetic_count,
+                'strategies': self._synthetic_generators,
+            }
+            print(f"[MelDataset] Synthetic data enabled: {summary}")
+
     def __len__(self):
-        return len(self.data_list)
+        if not self.synthetic_enabled:
+            return self._base_length
+        return self._base_length + self._synthetic_count
 
     # ------------------------------------------------------------------
     # Multiprocessing support helpers
@@ -144,53 +173,31 @@ class MelDataset(torch.utils.data.Dataset):
         wave_tensor, wave_sr = self._load_tensor(path)
         waveform = wave_tensor.numpy()
         if waveform.ndim > 1:
-            waveform = np.mean(waveform, axis=1)
+            waveform = np.mean(waveform, axis=-1)
         waveform = waveform.astype(np.float32)
         if wave_sr != self.sr:
             waveform = self._resample_waveform(waveform, wave_sr, self.sr)
             wave_sr = self.sr
 
         f0 = self._load_or_compute_f0(path, waveform, wave_sr)
-        
+
         if self.data_augmentation:
             random_scale = 0.5 + 0.5 * np.random.random()
-            wave_tensor = random_scale * wave_tensor
+            waveform = random_scale * waveform
 
-        wave_tensor = torch.from_numpy(waveform).float()
-        expected_metadata = self._build_mel_metadata(wave_tensor, wave_sr)
-        mel_tensor = self._load_cached_mel(path, expected_metadata)
-        if mel_tensor is None:
-            mel_tensor = self.to_melspec(wave_tensor)
-            if self._cache_enabled and not self.data_augmentation:
-                self._save_mel_cache(path, mel_tensor, expected_metadata)
-        mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
-        mel_length = mel_tensor.size(1)
-
-        f0 = self.f0_extractor.align_length(f0, mel_length)
-        f0 = torch.from_numpy(f0).float()
-
-        f0_zero = (f0 == 0)
-        
-        #######################################
-        # You may want your own silence labels here
-        # The more accurate the label, the better the resultss
-        is_silence = torch.zeros(f0.shape)
-        is_silence[f0_zero] = 1
-        #######################################
-        
-        if mel_length > self.max_mel_length:
-            random_start = np.random.randint(0, mel_length - self.max_mel_length)
-            mel_tensor = mel_tensor[:, random_start:random_start + self.max_mel_length]
-            f0 = f0[random_start:random_start + self.max_mel_length]
-            is_silence = is_silence[random_start:random_start + self.max_mel_length]
-        
-        if torch.any(torch.isnan(f0)): # failed
-            f0[torch.isnan(f0)] = self.zero_value # replace nan value with 0
-
-        return mel_tensor, f0, is_silence
+        return self._build_training_example(
+            waveform,
+            sr=wave_sr,
+            f0=f0,
+            cache_key=path,
+            allow_cache=not self.data_augmentation,
+        )
 
 
     def __getitem__(self, idx):
+        if self.synthetic_enabled and idx >= self._base_length:
+            return self._generate_synthetic_sample()
+
         data = self.data_list[idx]
         mel_tensor, f0, is_silence = self.path_to_mel_and_label(data)
         return mel_tensor, f0, is_silence
@@ -200,6 +207,193 @@ class MelDataset(torch.utils.data.Dataset):
         wave, sr = sf.read(wave_path)
         wave_tensor = torch.from_numpy(wave).float()
         return wave_tensor, sr
+
+    # ------------------------------------------------------------------
+    # Synthetic data helpers
+    def _initialise_synthetic_generators(self):
+        config = self.synthetic_config
+        ratio = float(config.get('ratio', 0.0))
+        absolute_count = config.get('absolute_count')
+        max_items = config.get('max_items')
+        min_items = config.get('min_items', 0)
+
+        if absolute_count is not None:
+            self._synthetic_count = max(0, int(absolute_count))
+        else:
+            target = int(round(self._base_length * ratio))
+            if ratio > 0 and target == 0 and self._base_length > 0:
+                target = 1
+            self._synthetic_count = max(0, target)
+
+        if max_items is not None:
+            self._synthetic_count = min(self._synthetic_count, int(max_items))
+        if min_items:
+            self._synthetic_count = max(self._synthetic_count, int(min_items))
+
+        pitch_shift_cfg = config.get('pitch_shift', {}) or {}
+        pitch_shift_enabled = pitch_shift_cfg.get('enabled', True)
+        if pitch_shift_enabled:
+            if librosa is None:
+                if self.verbose:
+                    print("[MelDataset] Pitch-shift augmentation disabled: librosa not available.")
+            elif not self.data_list:
+                if self.verbose:
+                    print("[MelDataset] Pitch-shift augmentation disabled: no base samples available.")
+            else:
+                self._synthetic_generators.append('pitch_shift')
+        self.synthetic_pitch_shift_config = pitch_shift_cfg
+
+        world_cfg = config.get('world_vocoder', {}) or {}
+        world_enabled = world_cfg.get('enabled', False)
+        if world_enabled:
+            try:
+                self._world_synthesizer = WorldSynthesizer(
+                    sample_rate=self.sr,
+                    hop_length=self.mel_params['hop_length'],
+                    fft_size=self.mel_params.get('n_fft', 1024),
+                    config=world_cfg,
+                    verbose=self.verbose,
+                )
+            except (ImportError, RuntimeError, ValueError) as exc:
+                self._world_synthesizer = None
+                if self.verbose:
+                    print(f"[MelDataset] WORLD vocoder synthetic generation disabled: {exc}")
+            else:
+                self._synthetic_generators.append('world_vocoder')
+
+        if not self._synthetic_generators or self._synthetic_count <= 0:
+            self.synthetic_enabled = False
+            self._synthetic_generators = []
+            self._synthetic_count = 0
+            if self.verbose:
+                print("[MelDataset] Synthetic data disabled: no valid generators or count is zero.")
+
+    def _generate_synthetic_sample(self):
+        if not self._synthetic_generators:
+            raise RuntimeError("Synthetic generation requested but no generators are available")
+
+        generator_name = random.choice(self._synthetic_generators)
+        if generator_name == 'pitch_shift':
+            result = self._generate_pitch_shift_sample()
+            if result is not None:
+                return result
+            # fall back to another generator if pitch shift failed
+            remaining = [g for g in self._synthetic_generators if g != 'pitch_shift']
+            if remaining:
+                generator_name = random.choice(remaining)
+            else:
+                # as a last resort, try again with pitch shift to avoid crashing
+                result = self._generate_pitch_shift_sample(force=True)
+                if result is not None:
+                    return result
+                raise RuntimeError("Unable to produce synthetic pitch-shift sample")
+
+        if generator_name == 'world_vocoder' and self._world_synthesizer is not None:
+            waveform, f0 = self._world_synthesizer.generate()
+            return self._build_training_example(
+                waveform.astype(np.float32),
+                sr=self.sr,
+                f0=f0.astype(np.float32),
+                cache_key=None,
+                allow_cache=False,
+            )
+
+        if generator_name != 'pitch_shift':
+            raise RuntimeError(f"Unknown synthetic generator '{generator_name}'")
+        # final attempt for pitch shift
+        result = self._generate_pitch_shift_sample(force=True)
+        if result is None:
+            raise RuntimeError("Failed to generate synthetic sample")
+        return result
+
+    def _generate_pitch_shift_sample(self, force=False):
+        if librosa is None:
+            return None
+
+        cfg = self.synthetic_pitch_shift_config or {}
+        semitone_choices = cfg.get('semitones') or [-4, -2, -1, 1, 2, 4]
+        if not semitone_choices:
+            return None
+
+        max_attempts = max(1, int(cfg.get('max_attempts', 5)))
+        min_voiced_fraction = float(cfg.get('min_voiced_fraction', 0.05))
+        gain_db_range = cfg.get('gain_db_range', [-6.0, 3.0])
+        if gain_db_range is None:
+            gain_db_range = None
+        elif isinstance(gain_db_range, (int, float)):
+            gain_db_range = (float(gain_db_range), float(gain_db_range))
+        else:
+            gain_db_range = tuple(float(v) for v in gain_db_range)
+        noise_db = cfg.get('noise_db', None)
+        if noise_db is not None:
+            noise_db = float(noise_db)
+        keep_original_when_zero = bool(cfg.get('keep_zero_pitch', True))
+        res_type = cfg.get('resample_type', 'kaiser_best')
+
+        for attempt in range(max_attempts):
+            base_path = random.choice(self.data_list)
+            wave_tensor, wave_sr = self._load_tensor(base_path)
+            waveform = wave_tensor.numpy()
+            if waveform.ndim > 1:
+                waveform = np.mean(waveform, axis=-1)
+            waveform = waveform.astype(np.float32)
+            if wave_sr != self.sr:
+                waveform = self._resample_waveform(waveform, wave_sr, self.sr)
+            base_f0 = self._load_or_compute_f0(base_path, waveform, self.sr)
+            if base_f0.size == 0:
+                if force and attempt == max_attempts - 1:
+                    break
+                continue
+            voiced_fraction = float(np.count_nonzero(base_f0 > 0)) / max(1, base_f0.size)
+            if voiced_fraction < min_voiced_fraction:
+                if force and attempt == max_attempts - 1:
+                    break
+                continue
+
+            semitone = random.choice(semitone_choices)
+            if semitone == 0 and not force:
+                if force and attempt == max_attempts - 1:
+                    break
+                continue
+
+            try:
+                shifted_waveform = librosa.effects.pitch_shift(
+                    waveform,
+                    sr=self.sr,
+                    n_steps=float(semitone),
+                    res_type=res_type,
+                )
+            except Exception:
+                if force and attempt == max_attempts - 1:
+                    raise
+                continue
+
+            ratio = float(2 ** (semitone / 12.0))
+            shifted_f0 = base_f0.astype(np.float32) * ratio
+            if keep_original_when_zero:
+                shifted_f0[base_f0 == 0] = 0.0
+
+            if gain_db_range is not None:
+                low, high = gain_db_range
+                if low > high:
+                    low, high = high, low
+                gain = 10.0 ** (random.uniform(low, high) / 20.0)
+                shifted_waveform = shifted_waveform * gain
+
+            if noise_db is not None:
+                noise_gain = 10.0 ** (noise_db / 20.0)
+                noise = np.random.normal(scale=noise_gain, size=shifted_waveform.shape)
+                shifted_waveform = shifted_waveform + noise.astype(np.float32)
+
+            return self._build_training_example(
+                shifted_waveform.astype(np.float32),
+                sr=self.sr,
+                f0=shifted_f0,
+                cache_key=None,
+                allow_cache=False,
+            )
+
+        return None
 
     def _f0_cache_paths(self, path):
         data_path = path + self.f0_cache_suffix
@@ -284,6 +478,56 @@ class MelDataset(torch.utils.data.Dataset):
         tensor = torch.from_numpy(waveform).unsqueeze(0)
         resampled = torchaudio.functional.resample(tensor, source_sr, target_sr)
         return resampled.squeeze(0).cpu().numpy()
+
+    def _build_training_example(self, waveform, sr, f0, cache_key=None, allow_cache=True):
+        if waveform.ndim > 1:
+            waveform = np.mean(waveform, axis=-1)
+        waveform = waveform.astype(np.float32)
+        if sr != self.sr:
+            waveform = self._resample_waveform(waveform, sr, self.sr)
+            sr = self.sr
+
+        wave_tensor = torch.from_numpy(waveform).float()
+        expected_metadata = None
+        mel_tensor = None
+        if cache_key is not None and allow_cache:
+            expected_metadata = self._build_mel_metadata(wave_tensor, sr)
+            mel_tensor = self._load_cached_mel(cache_key, expected_metadata)
+        if mel_tensor is None:
+            mel_tensor = self.to_melspec(wave_tensor)
+            if cache_key is not None and allow_cache and self._cache_enabled:
+                if expected_metadata is None:
+                    expected_metadata = self._build_mel_metadata(wave_tensor, sr)
+                self._save_mel_cache(cache_key, mel_tensor, expected_metadata)
+
+        mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
+        mel_length = mel_tensor.size(1)
+
+        if f0 is None:
+            f0 = np.zeros((mel_length,), dtype=np.float32)
+        else:
+            f0 = self.f0_extractor.align_length(f0, mel_length)
+        f0_tensor = torch.from_numpy(f0).float()
+
+        f0_zero = (f0_tensor == 0)
+
+        #######################################
+        # You may want your own silence labels here
+        # The more accurate the label, the better the results
+        is_silence = torch.zeros(f0_tensor.shape)
+        is_silence[f0_zero] = 1
+        #######################################
+
+        if mel_length > self.max_mel_length:
+            random_start = np.random.randint(0, mel_length - self.max_mel_length)
+            mel_tensor = mel_tensor[:, random_start:random_start + self.max_mel_length]
+            f0_tensor = f0_tensor[random_start:random_start + self.max_mel_length]
+            is_silence = is_silence[random_start:random_start + self.max_mel_length]
+
+        if torch.any(torch.isnan(f0_tensor)):  # failed
+            f0_tensor[torch.isnan(f0_tensor)] = self.zero_value  # replace nan value with 0
+
+        return mel_tensor, f0_tensor, is_silence
 
     def _build_mel_metadata(self, wave_tensor, wave_sr):
         num_samples = int(wave_tensor.shape[0]) if wave_tensor.ndim > 0 else int(wave_tensor.numel())

@@ -151,4 +151,26 @@ dataset_params:
           max_pitch: 1100.0
           silence_threshold: 0.03
           voicing_threshold: 0.45
+  synthetic_data:
+    enabled: false
+    ratio: 0.25
+    apply_to_validation: false
+    pitch_shift:
+      enabled: true
+      semitones: [-4, -2, -1, 1, 2, 4]
+      gain_db_range: [-6.0, 3.0]
+      min_voiced_fraction: 0.05
+      resample_type: kaiser_best
+    world_vocoder:
+      enabled: false
+      duration:
+        min: 0.6
+        max: 1.5
+      pitch_range: [110.0, 320.0]
+      gain_db_range: [-18.0, -6.0]
+      noise_db: -60.0
+      modulation:
+        vibrato_probability: 0.5
+        vibrato_semitones: 0.4
+        vibrato_rate_range: [4.0, 6.0]
   
