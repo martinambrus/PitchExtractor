@@ -15,6 +15,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 import logging
+from contextlib import nullcontext
+from torch.cuda import amp
+from torch.utils import checkpoint
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -31,7 +34,9 @@ class Trainer(object):
                  train_dataloader=None,
                  val_dataloader=None,
                  initial_steps=0,
-                 initial_epochs=0):
+                 initial_epochs=0,
+                 use_mixed_precision=False,
+                 gradient_checkpointing=False):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -46,7 +51,16 @@ class Trainer(object):
         self.device = device
         self.finish_train = False
         self.logger = logger
-        self.fp16_run = False
+        device_type = torch.device(self.device).type if isinstance(self.device, (str, torch.device)) else "cpu"
+        self.use_amp = bool(use_mixed_precision and device_type == "cuda")
+        self.scaler = amp.GradScaler(enabled=self.use_amp)
+        self.gradient_checkpointing = bool(gradient_checkpointing and device_type == "cuda")
+        if gradient_checkpointing and device_type != "cuda":
+            self.logger.warning("Gradient checkpointing requested but CUDA is unavailable; disabling.")
+        if self.use_amp:
+            self.logger.info("Using mixed precision training with torch.cuda.amp")
+        if self.gradient_checkpointing:
+            self.logger.info("Gradient checkpointing enabled for training")
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -130,20 +144,36 @@ class Trainer(object):
         return lr
 
     def run(self, batch):
-        self.optimizer.zero_grad()
-        batch = [b.to(self.device) for b in batch]
-        
+        self.optimizer.zero_grad(set_to_none=True)
+        batch = [b.to(self.device, non_blocking=True) for b in batch]
+
         x, f0, sil = batch
-        f0_pred, sil_pred = self.model(x.transpose(-1, -2))
-        
-        loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
-        loss_sil = self.criterion['ce'](sil_pred, sil)
-        loss = loss_f0 + loss_sil
-        
-        loss.backward()
-        self.optimizer.step()
+        autocast_context = amp.autocast if self.use_amp else nullcontext
+
+        with autocast_context():
+            if self.gradient_checkpointing:
+                x = x.requires_grad_()
+
+                def forward_fn(inp):
+                    return self.model(inp.transpose(-1, -2))
+
+                f0_pred, sil_pred = checkpoint.checkpoint(forward_fn, x)
+            else:
+                f0_pred, sil_pred = self.model(x.transpose(-1, -2))
+
+            loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
+            loss_sil = self.criterion['ce'](sil_pred, sil)
+            loss = loss_f0 + loss_sil
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
         self.scheduler.step()
-        
+
         return {'loss': loss.item(),
                 'f0': loss_f0.item(),
                 'sil': loss_sil.item()}
@@ -167,16 +197,18 @@ class Trainer(object):
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
-            batch = [b.to(self.device) for b in batch]
+            batch = [b.to(self.device, non_blocking=True) for b in batch]
             x, f0, sil = batch
-            
-            f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
-            loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
-            loss_sil = self.criterion['ce'](sil_pred, sil)
-            loss = loss_f0 + loss_sil
-            
-            
+            autocast_context = amp.autocast if self.use_amp else nullcontext
+            with autocast_context():
+                f0_pred, sil_pred = self.model(x.transpose(-1, -2))
+
+                loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
+                loss_sil = self.criterion['ce'](sil_pred, sil)
+                loss = loss_f0 + loss_sil
+
+
             eval_losses["eval/loss"].append(loss.item())
             eval_losses["eval/f0"].append(loss_f0.item())
             eval_losses["eval/sil"].append(loss_sil.item())

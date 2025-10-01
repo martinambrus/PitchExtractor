@@ -65,6 +65,7 @@ def main(config_path):
     train_path = config.get('train_data', None)
     val_path = config.get('val_data', None)
     num_workers = config.get('num_workers', 8)
+    training_config = config.get('training', {})
 
     train_list, val_list = get_data_path_list(train_path, val_path)
 
@@ -114,7 +115,9 @@ def main(config_path):
                         train_dataloader=train_dataloader,
                         val_dataloader=val_dataloader,
                         loss_config=loss_config,
-                        logger=logger)
+                        logger=logger,
+                        use_mixed_precision=training_config.get('mixed_precision', True),
+                        gradient_checkpointing=training_config.get('gradient_checkpointing', False))
 
     if config.get('pretrained_model', '') != '':
         trainer.load_checkpoint(config['pretrained_model'],
