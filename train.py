@@ -117,7 +117,8 @@ def main(config_path):
                         loss_config=loss_config,
                         logger=logger,
                         use_mixed_precision=training_config.get('mixed_precision', True),
-                        gradient_checkpointing=training_config.get('gradient_checkpointing', False))
+                        gradient_checkpointing=training_config.get('gradient_checkpointing', False),
+                        checkpoint_use_reentrant=training_config.get('gradient_checkpointing_use_reentrant'))
 
     if config.get('pretrained_model', '') != '':
         trainer.load_checkpoint(config['pretrained_model'],

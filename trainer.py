@@ -44,7 +44,8 @@ class Trainer(object):
                  initial_steps=0,
                  initial_epochs=0,
                  use_mixed_precision=False,
-                 gradient_checkpointing=False):
+                 gradient_checkpointing=False,
+                 checkpoint_use_reentrant=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -102,8 +103,37 @@ class Trainer(object):
         self.gradient_checkpointing = bool(gradient_checkpointing and device_type == "cuda")
         if gradient_checkpointing and device_type != "cuda":
             self.logger.warning("Gradient checkpointing requested but CUDA is unavailable; disabling.")
+        self._checkpoint_kwargs = {}
+        self.gradient_checkpoint_use_reentrant = None
+        self._checkpoint_supports_use_reentrant = False
         if self.gradient_checkpointing:
             self.logger.info("Gradient checkpointing enabled for training")
+            try:
+                checkpoint_signature = inspect.signature(checkpoint.checkpoint)
+            except (TypeError, ValueError):
+                checkpoint_signature = None
+
+            if checkpoint_signature is not None and "use_reentrant" in checkpoint_signature.parameters:
+                self._checkpoint_supports_use_reentrant = True
+
+            desired_use_reentrant = checkpoint_use_reentrant
+            if desired_use_reentrant is None and self._checkpoint_supports_use_reentrant:
+                desired_use_reentrant = False
+
+            if desired_use_reentrant is not None and not self._checkpoint_supports_use_reentrant:
+                self.logger.warning(
+                    "This PyTorch version does not support the use_reentrant flag; proceeding with the default checkpoint behaviour."
+                )
+                desired_use_reentrant = None
+
+            self.gradient_checkpoint_use_reentrant = desired_use_reentrant
+
+            if self.gradient_checkpoint_use_reentrant is not None:
+                self.logger.info(
+                    "Gradient checkpointing will run with use_reentrant=%s",
+                    self.gradient_checkpoint_use_reentrant,
+                )
+                self._checkpoint_kwargs["use_reentrant"] = self.gradient_checkpoint_use_reentrant
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -200,7 +230,7 @@ class Trainer(object):
                 def forward_fn(inp):
                     return self.model(inp.transpose(-1, -2))
 
-                f0_pred, sil_pred = checkpoint.checkpoint(forward_fn, x)
+                f0_pred, sil_pred = checkpoint.checkpoint(forward_fn, x, **self._checkpoint_kwargs)
             else:
                 f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
