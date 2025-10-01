@@ -17,6 +17,7 @@ pip install SoundFile torchaudio torch pyyaml click matplotlib librosa pyworld
    | Backend        | Installation command / notes |
    | -------------- | ----------------------------- |
    | TorchCrepe     | `pip install torchcrepe` |
+   | SwiftF0        | `pip install swift-f0` (installs ONNX Runtime; requires `librosa` when resampling) |
    | Praat / Parselmouth | `pip install praat-parselmouth` |
 
    These packages are only needed when you enable the corresponding backend in `Configs/config.yml`. The training pipeline will gracefully skip any backend whose dependency is missing.
@@ -43,6 +44,7 @@ Whenever the backend configuration changes the dataset automatically regenerates
 
 - **PyWorld (harvest/dio/stonemask)** – Controlled by the `algorithm`, optional `fallback` algorithm, and `stonemask` refinement flag.
 - **TorchCrepe (CREPE)** – Choose `model` (`tiny`, `small`, `medium`, `full`), override `step_size_ms`, constrain the search range via `fmin`/`fmax`, and tune batching (`batch_size`), padding, and optional `median_filter_size`. Enable `return_periodicity` to obtain confidence scores and zero out low-confidence frames with `periodicity_threshold`. `device` accepts `auto` (prefer CUDA) or an explicit torch device string such as `cpu`, `cuda`, or `cuda:1`. When any enabled backend requests CUDA the dataloader automatically switches to the `spawn` multiprocessing context so TorchCrepe can initialise GPUs inside worker processes; override this behaviour via `dataset_params.dataloader.start_method` if necessary.
+- **SwiftF0** – Uses a learnable filterbank front-end and an ONNX Runtime CNN to analyse spectrogram patches. Configure `confidence_threshold`, `fmin`, `fmax`, and `unvoiced_value` to focus on the frequency band that matters for your data, suppress noisy detections, and control how unvoiced frames are filled. Runs efficiently on CPU; requires the `swift-f0` package (and `librosa` for resampling when your dataset is not at 16 kHz).
 - **Praat / Parselmouth** – Set the `method` (e.g., `ac`, `cc`), `min_pitch`/`max_pitch` bounds, and adjust `silence_threshold` and `voicing_threshold` for sensitivity.
 
 The optional `dataset_params.dataloader` dictionary lets you fine-tune how the `DataLoader` is constructed (for example, setting `start_method`, `persistent_workers`, or `prefetch_factor`). When omitted the builder keeps PyTorch defaults, only forcing `start_method: spawn` when CUDA-enabled F0 backends would otherwise hit the "Cannot re-initialize CUDA in forked subprocess" error.
