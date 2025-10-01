@@ -349,6 +349,91 @@ class CrepeBackend(BaseF0Backend):
         return f0
 
 
+class SwiftF0Backend(BaseF0Backend):
+    """SwiftF0 backend driven by the official ONNX implementation."""
+
+    backend_type = "swiftf0"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        try:
+            from swift_f0 import SwiftF0  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise BackendUnavailableError(
+                "swift-f0 is not installed; install it with 'pip install swift-f0'"
+            ) from exc
+
+        # ``SwiftF0`` operates on 16 kHz audio with a hop of 256 samples,
+        # corresponding to a 16 ms frame period. Expose that as the default
+        # frame period so downstream caches have consistent expectations even
+        # when the dataset uses a different hop length.
+        model_frame_period_ms = 1000.0 * SwiftF0.HOP_LENGTH / SwiftF0.TARGET_SAMPLE_RATE
+        self.config.setdefault("frame_period_ms", model_frame_period_ms)
+
+        def _maybe_float(key: str) -> Optional[float]:
+            value = self.config.get(key)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid float value for '{key}' in SwiftF0 backend: {value!r}"
+                ) from exc
+
+        confidence_threshold = _maybe_float("confidence_threshold")
+        fmin = _maybe_float("fmin")
+        fmax = _maybe_float("fmax")
+
+        try:
+            self._model = SwiftF0(
+                confidence_threshold=confidence_threshold,
+                fmin=fmin,
+                fmax=fmax,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            raise BackendUnavailableError(f"Failed to initialise SwiftF0: {exc}") from exc
+
+        self.zero_unvoiced = bool(self.config.get("zero_unvoiced", True))
+        unvoiced_value = self.config.get("unvoiced_value", 0.0)
+        try:
+            self.unvoiced_value = float(0.0 if unvoiced_value is None else unvoiced_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid float value for 'unvoiced_value' in SwiftF0 backend: {unvoiced_value!r}"
+            ) from exc
+        self.requires_cuda = False
+
+    def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> np.ndarray:
+        sr = int(sr or self.sample_rate)
+        waveform = np.asarray(audio, dtype=np.float32)
+        if waveform.ndim != 1:
+            waveform = waveform.reshape(-1)
+
+        try:
+            result = self._model.detect_from_array(waveform, sr)
+        except ImportError as exc:
+            raise BackendUnavailableError(
+                "SwiftF0 requires 'librosa' for resampling when the input sample rate is not 16 kHz."
+            ) from exc
+        except FileNotFoundError as exc:
+            raise BackendUnavailableError(f"SwiftF0 model file is missing: {exc}") from exc
+        except Exception as exc:  # pragma: no cover - defensive
+            raise BackendComputationError(f"SwiftF0 failed to compute F0: {exc}") from exc
+
+        f0 = np.asarray(result.pitch_hz, dtype=np.float64)
+        mean_conf = float(np.mean(result.confidence)) if result.confidence.size else 0.0
+        self.log(f"SwiftF0 analysed {f0.size} frames with mean confidence {mean_conf:.3f}.")
+
+        if self.zero_unvoiced:
+            voicing = np.asarray(result.voicing, dtype=bool)
+            if voicing.size:
+                f0 = f0.copy()
+                f0[~voicing] = self.unvoiced_value
+
+        return f0
+
+
 class PraatBackend(BaseF0Backend):
     backend_type = "praat"
 
@@ -502,6 +587,7 @@ class ParselmouthBackend(PraatBackend):
 BACKEND_REGISTRY = {
     "pyworld": PyWorldBackend,
     "crepe": CrepeBackend,
+    "swiftf0": SwiftF0Backend,
     "praat": PraatBackend,
     "parselmouth": ParselmouthBackend,
 }

@@ -47,6 +47,10 @@ dataset_params:
       # and noisy material. Enable it when you have the dependency installed and
       # want a data-driven approach.
       - crepe
+      # SwiftF0 runs an ONNX CNN over band-limited spectrogram features. It is
+      # CPU-friendly and focuses on useful frequency ranges via learnable
+      # filterbanks.
+      - swiftf0
       # Praat accesses the classic signal-processing F0 algorithms via the
       # parselmouth bindings. The ``method`` parameter accepts values like
       # "ac" (autocorrelation) or "cc" (cross-correlation).
@@ -99,6 +103,18 @@ dataset_params:
           periodicity_threshold: 0.1
           median_filter_size: 0
           device: auto
+      # SwiftF0 uses an STFT front-end with learnable filterbanks followed by a
+      # convolutional model. It runs on CPU via ONNX Runtime. Customize the
+      # confidence threshold and frequency range to suppress noisy detections.
+      swiftf0:
+        type: swiftf0
+        enabled: false
+        config:
+          confidence_threshold: 0.9
+          fmin: 60.0
+          fmax: 2000.0
+          zero_unvoiced: true
+          unvoiced_value: 0.0
       # Praat backend via parselmouth. ``method`` matches Praat's choices such
       # as "ac" (autocorrelation) or "cc" (cross-correlation). ``min_pitch`` and
       # ``max_pitch`` set the allowed frequency range in Hertz. The
