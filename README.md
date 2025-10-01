@@ -1,5 +1,7 @@
 # JDC-PitchExtractor
-This repo contains the training code for deep neural pitch extractor for Voice Conversion (VC) and TTS used in [StarGANv2-VC](https://github.com/yl4579/StarGANv2-VC) and [StyleTTS](https://github.com/yl4579/StyleTTS). This is the F0 network in StarGANv2-VC and pitch extractor in StyleTTS. 
+This repo contains the training code for deep neural pitch extractor for Voice Conversion (VC) and TTS used in [StarGANv2-VC](https://github.com/yl4579/StarGANv2-VC) and [StyleTTS](https://github.com/yl4579/StyleTTS). This is the F0 network in StarGANv2-VC and pitch extractor in StyleTTS.
+
+The project now defaults to a Conformer-based backbone that combines self-attention with depthwise convolutions for improved accuracy, robustness, and temporal modelling. The legacy JDCNet architecture is still available via the `model_params.architecture` setting when compatibility with earlier checkpoints is required.
 
 ## Pre-requisites
 1. Python >= 3.7
@@ -28,6 +30,8 @@ pip install SoundFile torchaudio torch pyyaml click matplotlib librosa pyworld
 python train.py --config_path ./Configs/config.yml
 ```
 Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|anything`, see [train_list.txt](https://github.com/yl4579/StarGANv2-VC/blob/main/Data/train_list.txt) as an example (a subset of VCTK). Note that you can put anything after the filename because the training labels are generated ad-hoc.
+
+The `model_params` section in the configuration controls the Conformer backbone hyperparameters (model width, depth, number of heads, etc.) and also lets you switch back to the original `jdcnet` implementation if necessary.
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take. 
 

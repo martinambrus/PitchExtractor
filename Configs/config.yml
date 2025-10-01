@@ -15,6 +15,16 @@ optimizer_params:
 loss_params:
   lambda_f0: 0.1
 
+model_params:
+  architecture: conformer
+  num_class: 1
+  d_model: 256
+  num_layers: 6
+  num_heads: 4
+  ff_multiplier: 4.0
+  conv_kernel: 31
+  dropout: 0.1
+
 dataset_params:
   mel_params:
     sample_rate: 24000
