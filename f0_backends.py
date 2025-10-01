@@ -40,6 +40,7 @@ class BackendResult:
     f0: np.ndarray
     backend_name: str
     details: Optional[str] = None
+    contributing_backends: Optional[List[str]] = None
 
 
 class BaseF0Backend:
@@ -659,6 +660,39 @@ class F0Extractor:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Invalid zero_fill_value: {zero_fill!r}") from exc
 
+        raw_ensemble_cfg = config.get("ensemble")
+        if isinstance(raw_ensemble_cfg, bool):
+            ensemble_cfg = {"enabled": raw_ensemble_cfg}
+        elif raw_ensemble_cfg is None:
+            ensemble_cfg = {}
+        elif isinstance(raw_ensemble_cfg, dict):
+            ensemble_cfg = dict(raw_ensemble_cfg)
+        else:
+            raise ValueError("ensemble configuration must be a mapping or boolean")
+
+        self._ensemble_enabled = bool(ensemble_cfg.get("enabled", False))
+        self._ensemble_method = str(ensemble_cfg.get("method", "median") or "median").lower()
+        if self._ensemble_method not in {"median", "mean", "average"}:
+            raise ValueError(
+                "ensemble.method must be one of {'median', 'mean', 'average'}"
+            )
+        agreement_cents = ensemble_cfg.get("agreement_cents", ensemble_cfg.get("agreement_threshold", 35.0))
+        try:
+            self._ensemble_agreement_cents = float(agreement_cents)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ensemble.agreement_cents must be a float") from exc
+        self._ensemble_min_agreement = int(ensemble_cfg.get("min_agreement_sources", 1) or 0)
+        if self._ensemble_min_agreement < 0:
+            raise ValueError("ensemble.min_agreement_sources must be >= 0")
+        self._ensemble_require_consensus = bool(ensemble_cfg.get("discard_inconsistent", True))
+        fallback_value = ensemble_cfg.get("fallback_value", self.zero_fill_value)
+        try:
+            self._ensemble_fallback_value = float(fallback_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ensemble.fallback_value must be numeric") from exc
+
+        self._last_ensemble_members: List[str] = []
+
         backends_config = config.get("backends") or {}
         sequence_config = config.get("backend_order")
         if sequence_config:
@@ -760,6 +794,7 @@ class F0Extractor:
     # ------------------------------------------------------------------
     def compute(self, audio: np.ndarray, sr: Optional[int] = None) -> BackendResult:
         sr = int(sr or self.sample_rate)
+        results: List[BackendResult] = []
         for backend in self.backends:
             try:
                 f0 = backend.compute(audio, sr)
@@ -773,16 +808,108 @@ class F0Extractor:
             if f0 is None:
                 continue
             f0 = np.asarray(f0, dtype=np.float64)
-            if np.count_nonzero(f0) < self.bad_f0_threshold:
+            non_zero = int(np.count_nonzero(f0))
+            if non_zero < self.bad_f0_threshold:
                 LOGGER.warning(
                     "Backend '%s' returned only %d voiced frames; attempting next backend.",
                     backend.name,
-                    int(np.count_nonzero(f0)),
+                    non_zero,
                 )
-                continue
-            return BackendResult(f0=f0, backend_name=backend.name)
+                if not self._ensemble_enabled:
+                    continue
+            result = BackendResult(f0=f0, backend_name=backend.name)
+            if not self._ensemble_enabled:
+                return result
+            results.append(result)
+
+        if self._ensemble_enabled and results:
+            combined = self._combine_backend_results(results)
+            if np.count_nonzero(combined.f0) >= self.bad_f0_threshold:
+                return combined
+            LOGGER.warning(
+                "Ensemble combination produced insufficient voiced frames (%d); falling back to best individual backend.",
+                int(np.count_nonzero(combined.f0)),
+            )
+            # Try to salvage the best individual backend result before giving up.
+            best_candidate = max(results, key=lambda item: int(np.count_nonzero(item.f0)))
+            if np.count_nonzero(best_candidate.f0) >= self.bad_f0_threshold:
+                return best_candidate
 
         raise BackendComputationError("All configured F0 backends failed to produce a valid contour.")
+
+    # ------------------------------------------------------------------
+    def _combine_backend_results(self, results: List[BackendResult]) -> BackendResult:
+        self._last_ensemble_members = [result.backend_name for result in results]
+        if not results:
+            raise BackendComputationError("Cannot combine F0 backends without any successful results.")
+
+        target_frames = max(result.f0.size for result in results)
+        if target_frames <= 0:
+            return BackendResult(
+                f0=np.zeros((0,), dtype=np.float64),
+                backend_name="ensemble",
+                details="No frames produced by any backend.",
+                contributing_backends=list(self._last_ensemble_members),
+            )
+
+        aligned = []
+        for result in results:
+            aligned.append(self.align_length(result.f0, target_frames).astype(np.float64, copy=False))
+
+        stacked = np.stack(aligned, axis=0)
+        positive_mask = stacked > 0.0
+
+        if not np.any(positive_mask):
+            return BackendResult(
+                f0=np.full(target_frames, self._ensemble_fallback_value, dtype=np.float64),
+                backend_name="ensemble",
+                details="All ensemble members reported unvoiced frames.",
+                contributing_backends=list(self._last_ensemble_members),
+            )
+
+        log_values = np.full_like(stacked, np.nan, dtype=np.float64)
+        log_values[positive_mask] = np.log2(stacked[positive_mask])
+
+        if self._ensemble_require_consensus:
+            median_log = np.nanmedian(log_values, axis=0)
+            diff_cents = np.abs(log_values - median_log) * 1200.0
+            consistent_mask = diff_cents <= self._ensemble_agreement_cents
+            consistent_mask &= positive_mask
+        else:
+            consistent_mask = positive_mask
+
+        aggregate = np.full(target_frames, self._ensemble_fallback_value, dtype=np.float64)
+        consistent_counts = consistent_mask.sum(axis=0)
+
+        for frame_idx in range(target_frames):
+            if consistent_counts[frame_idx] <= 0:
+                continue
+            if self._ensemble_min_agreement and consistent_counts[frame_idx] < self._ensemble_min_agreement:
+                continue
+            frame_values = stacked[consistent_mask[:, frame_idx], frame_idx]
+            if frame_values.size == 0:
+                continue
+            if self._ensemble_method == "median":
+                aggregate[frame_idx] = float(np.median(frame_values))
+            else:  # mean / average
+                aggregate[frame_idx] = float(np.mean(frame_values))
+
+        voiced_frames = int(np.count_nonzero(aggregate))
+        details = (
+            "method={method}, agreement_cents={cents:.1f}, min_sources={min_sources}, voiced_frames={voiced}"
+        ).format(
+            method=self._ensemble_method,
+            cents=self._ensemble_agreement_cents,
+            min_sources=self._ensemble_min_agreement,
+            voiced=voiced_frames,
+        )
+
+        return BackendResult(
+            f0=aggregate,
+            backend_name="ensemble",
+            details=details,
+            contributing_backends=list(self._last_ensemble_members),
+        )
 
     # ------------------------------------------------------------------
     def align_length(self, values: np.ndarray, target_frames: int) -> np.ndarray:
