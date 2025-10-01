@@ -5,6 +5,7 @@ import os.path as osp
 import sys
 import time
 from collections import defaultdict
+import inspect
 
 import numpy as np
 import torch
@@ -15,6 +16,16 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 import logging
+from contextlib import nullcontext
+from torch.cuda.amp import GradScaler as CudaGradScaler, autocast as cuda_autocast
+from torch.utils import checkpoint
+
+try:
+    from torch.amp import autocast as torch_autocast
+    from torch.amp import GradScaler as TorchGradScaler
+except (ImportError, AttributeError):
+    torch_autocast = None
+    TorchGradScaler = None
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -31,7 +42,10 @@ class Trainer(object):
                  train_dataloader=None,
                  val_dataloader=None,
                  initial_steps=0,
-                 initial_epochs=0):
+                 initial_epochs=0,
+                 use_mixed_precision=False,
+                 gradient_checkpointing=False,
+                 checkpoint_use_reentrant=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -46,7 +60,80 @@ class Trainer(object):
         self.device = device
         self.finish_train = False
         self.logger = logger
-        self.fp16_run = False
+        device_type = torch.device(self.device).type if isinstance(self.device, (str, torch.device)) else "cpu"
+        self.use_amp = bool(use_mixed_precision and device_type == "cuda")
+        if TorchGradScaler is not None:
+            scaler_kwargs = {"enabled": self.use_amp}
+            try:
+                signature = inspect.signature(TorchGradScaler.__init__)
+            except (TypeError, ValueError):
+                signature = None
+
+            if signature is not None:
+                parameters = signature.parameters
+                if "device_type" in parameters:
+                    scaler_kwargs["device_type"] = device_type
+                elif "device" in parameters:
+                    scaler_kwargs["device"] = device_type
+
+            try:
+                self.scaler = TorchGradScaler(**scaler_kwargs)
+            except TypeError:
+                scaler_kwargs.pop("device_type", None)
+                scaler_kwargs.pop("device", None)
+                self.scaler = TorchGradScaler(**scaler_kwargs)
+            if self.use_amp:
+                self.logger.info("Using mixed precision scaling with torch.amp.GradScaler")
+        else:
+            self.scaler = CudaGradScaler(enabled=self.use_amp)
+            if self.use_amp:
+                self.logger.info("Using mixed precision scaling with torch.cuda.amp.GradScaler")
+        if self.use_amp:
+            if torch_autocast is not None:
+                def autocast_cm():
+                    return torch_autocast(device_type=device_type)
+
+                self.logger.info("Using mixed precision training with torch.amp.autocast")
+            else:
+                autocast_cm = cuda_autocast
+                self.logger.info("Using mixed precision training with torch.cuda.amp.autocast")
+        else:
+            autocast_cm = nullcontext
+        self._autocast_cm = autocast_cm
+        self.gradient_checkpointing = bool(gradient_checkpointing and device_type == "cuda")
+        if gradient_checkpointing and device_type != "cuda":
+            self.logger.warning("Gradient checkpointing requested but CUDA is unavailable; disabling.")
+        self._checkpoint_kwargs = {}
+        self.gradient_checkpoint_use_reentrant = None
+        self._checkpoint_supports_use_reentrant = False
+        if self.gradient_checkpointing:
+            self.logger.info("Gradient checkpointing enabled for training")
+            try:
+                checkpoint_signature = inspect.signature(checkpoint.checkpoint)
+            except (TypeError, ValueError):
+                checkpoint_signature = None
+
+            if checkpoint_signature is not None and "use_reentrant" in checkpoint_signature.parameters:
+                self._checkpoint_supports_use_reentrant = True
+
+            desired_use_reentrant = checkpoint_use_reentrant
+            if desired_use_reentrant is None and self._checkpoint_supports_use_reentrant:
+                desired_use_reentrant = False
+
+            if desired_use_reentrant is not None and not self._checkpoint_supports_use_reentrant:
+                self.logger.warning(
+                    "This PyTorch version does not support the use_reentrant flag; proceeding with the default checkpoint behaviour."
+                )
+                desired_use_reentrant = None
+
+            self.gradient_checkpoint_use_reentrant = desired_use_reentrant
+
+            if self.gradient_checkpoint_use_reentrant is not None:
+                self.logger.info(
+                    "Gradient checkpointing will run with use_reentrant=%s",
+                    self.gradient_checkpoint_use_reentrant,
+                )
+                self._checkpoint_kwargs["use_reentrant"] = self.gradient_checkpoint_use_reentrant
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -130,20 +217,36 @@ class Trainer(object):
         return lr
 
     def run(self, batch):
-        self.optimizer.zero_grad()
-        batch = [b.to(self.device) for b in batch]
-        
+        self.optimizer.zero_grad(set_to_none=True)
+        batch = [b.to(self.device, non_blocking=True) for b in batch]
+
         x, f0, sil = batch
-        f0_pred, sil_pred = self.model(x.transpose(-1, -2))
-        
-        loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
-        loss_sil = self.criterion['ce'](sil_pred, sil)
-        loss = loss_f0 + loss_sil
-        
-        loss.backward()
-        self.optimizer.step()
+        autocast_context = self._autocast_cm
+
+        with autocast_context():
+            if self.gradient_checkpointing:
+                x = x.requires_grad_()
+
+                def forward_fn(inp):
+                    return self.model(inp.transpose(-1, -2))
+
+                f0_pred, sil_pred = checkpoint.checkpoint(forward_fn, x, **self._checkpoint_kwargs)
+            else:
+                f0_pred, sil_pred = self.model(x.transpose(-1, -2))
+
+            loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
+            loss_sil = self.criterion['ce'](sil_pred, sil)
+            loss = loss_f0 + loss_sil
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
         self.scheduler.step()
-        
+
         return {'loss': loss.item(),
                 'f0': loss_f0.item(),
                 'sil': loss_sil.item()}
@@ -167,16 +270,18 @@ class Trainer(object):
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
-            batch = [b.to(self.device) for b in batch]
+            batch = [b.to(self.device, non_blocking=True) for b in batch]
             x, f0, sil = batch
-            
-            f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
-            loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
-            loss_sil = self.criterion['ce'](sil_pred, sil)
-            loss = loss_f0 + loss_sil
-            
-            
+            autocast_context = self._autocast_cm
+            with autocast_context():
+                f0_pred, sil_pred = self.model(x.transpose(-1, -2))
+
+                loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
+                loss_sil = self.criterion['ce'](sil_pred, sil)
+                loss = loss_f0 + loss_sil
+
+
             eval_losses["eval/loss"].append(loss.item())
             eval_losses["eval/f0"].append(loss_f0.item())
             eval_losses["eval/sil"].append(loss_sil.item())
