@@ -191,13 +191,23 @@ class Trainer(object):
         self._load(state_dict[model_key], self.model)
 
         self.ema_decay = state_dict.get("ema_decay", self.ema_decay)
-        if "ema_model" in state_dict and self.ema_decay > 0.0:
+        ema_state = state_dict.get("ema_model")
+        if self.ema_decay > 0.0:
             if self.ema_model is None:
                 self.ema_model = copy.deepcopy(self.model)
                 self.ema_model.to(self.device)
                 for param in self.ema_model.parameters():
                     param.requires_grad_(False)
-            self._load(state_dict["ema_model"], self.ema_model)
+            if ema_state is not None:
+                self._load(ema_state, self.ema_model)
+            else:
+                # Synchronize EMA weights with the loaded model when no EMA
+                # snapshot is available in the checkpoint.
+                self.ema_model.load_state_dict(self.model.state_dict())
+                self.logger.info(
+                    "EMA state missing from checkpoint; initialized EMA weights "
+                    "from current model parameters."
+                )
 
         if not load_only_params:
             self.steps = state_dict["steps"]
