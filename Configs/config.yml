@@ -13,6 +13,9 @@ training:
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
   ema_decay: 0.9997
+  swa:
+    enabled: true
+    max_checkpoints: 5
 
 model_params:
   num_class: 1

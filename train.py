@@ -18,6 +18,74 @@ from torch.utils.tensorboard import SummaryWriter
 import click
 from tqdm import tqdm
 
+
+class SWAManager:
+    """Track and average the last few best-performing model checkpoints."""
+
+    def __init__(self, enabled=False, max_checkpoints=5, logger=None):
+        self.enabled = bool(enabled)
+        self.max_checkpoints = int(max_checkpoints)
+        self.logger = logger
+        self._checkpoints = []
+
+    def add_checkpoint(self, trainer, metric_value, epoch):
+        if not self.enabled:
+            return
+
+        try:
+            metric_value = float(metric_value)
+        except (TypeError, ValueError):
+            return
+
+        state_dict = trainer.get_eval_model_state_dict()
+        self._checkpoints.append((int(epoch), metric_value, state_dict))
+        # Keep only the most recent checkpoints based on epoch index.
+        self._checkpoints.sort(key=lambda item: item[0])
+        if len(self._checkpoints) > self.max_checkpoints:
+            self._checkpoints = self._checkpoints[-self.max_checkpoints:]
+
+        if self.logger is not None:
+            try:
+                self.logger.info(
+                    "Added epoch %d to SWA pool (metric %.6f). Pool size: %d",
+                    epoch,
+                    metric_value,
+                    len(self._checkpoints),
+                )
+            except Exception:
+                pass
+
+    def num_checkpoints(self):
+        return len(self._checkpoints)
+
+    def _average_state_dicts(self):
+        if not self._checkpoints:
+            return None
+
+        num_states = len(self._checkpoints)
+        _, _, first_state = self._checkpoints[0]
+        averaged_state = copy.deepcopy(first_state)
+
+        for key, value in averaged_state.items():
+            if torch.is_tensor(value):
+                averaged_state[key] = value.clone()
+
+        for _, _, state in self._checkpoints[1:]:
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    averaged_state[key] += value
+
+        for key, value in averaged_state.items():
+            if torch.is_tensor(value):
+                averaged_state[key] = value / num_states
+
+        return averaged_state
+
+    def compute_swa_state_dict(self):
+        if not self.enabled:
+            return None
+        return self._average_state_dicts()
+
 import logging
 from logging import StreamHandler
 logger = logging.getLogger(__name__)
@@ -63,6 +131,7 @@ def _train_single_run(config, config_path, run_log_dir):
     val_path = config.get('val_data', None)
     num_workers = config.get('num_workers', 8)
     training_config = config.get('training', {})
+    swa_config = training_config.get('swa', {})
 
     train_list, val_list = get_data_path_list(train_path, val_path)
 
@@ -123,6 +192,12 @@ def _train_single_run(config, config_path, run_log_dir):
                         checkpoint_use_reentrant=training_config.get('gradient_checkpointing_use_reentrant'),
                         ema_decay=training_config.get('ema_decay', 0.0))
 
+    swa_manager = SWAManager(
+        enabled=swa_config.get('enabled', False),
+        max_checkpoints=swa_config.get('max_checkpoints', 5),
+        logger=logger,
+    )
+
     if config.get('pretrained_model', '') != '':
         trainer.load_checkpoint(config['pretrained_model'],
                                 load_only_params=config.get('load_only_params', True))
@@ -156,6 +231,21 @@ def _train_single_run(config, config_path, run_log_dir):
             best_eval_loss = eval_loss
             logger.info('New best model with eval/loss %.4f', best_eval_loss)
             trainer.save_checkpoint(osp.join(run_log_dir, 'best.pth'), use_ema_model=True)
+            swa_manager.add_checkpoint(trainer, eval_loss, epoch)
+
+    swa_state_dict = swa_manager.compute_swa_state_dict()
+    if swa_state_dict is not None:
+        swa_path = osp.join(run_log_dir, 'best_swa.pth')
+        torch.save({'model': swa_state_dict}, swa_path)
+        if logger is not None:
+            try:
+                logger.info(
+                    'Saved SWA checkpoint averaged from %d models to %s',
+                    swa_manager.num_checkpoints(),
+                    swa_path,
+                )
+            except Exception:
+                pass
 
     writer.close()
     logger.removeHandler(file_handler)

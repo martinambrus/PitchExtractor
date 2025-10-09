@@ -473,6 +473,15 @@ class Trainer(object):
                 'sil': loss_sil_raw.item(),
                 'sil_weighted': loss_sil.item()}
 
+    def get_eval_model_state_dict(self):
+        """Return a detached copy of the model weights used for evaluation."""
+
+        if self.ema_model is not None:
+            source_model = self.ema_model
+        else:
+            source_model = self.model
+        return copy.deepcopy(source_model.state_dict())
+
     def _train_epoch(self):
         self.epochs += 1
         train_losses = defaultdict(list)
