@@ -46,6 +46,7 @@ class MelDataset(torch.utils.data.Dataset):
                  mel_params=None,
                  f0_params=None,
                  data_augmentation=False,
+                 augmentation_config=None,
                  validation=False,
                  verbose=True,
                  synthetic_data=None,
@@ -110,6 +111,8 @@ class MelDataset(torch.utils.data.Dataset):
 
         self.mean, self.std = -4, 4
         self.data_augmentation = data_augmentation and (not validation)
+        self.augmentation_config = augmentation_config or {}
+        self._initialise_augmentation_settings()
         self.max_mel_length = 192
         self.mean, self.std = -4, 4
 
@@ -140,6 +143,150 @@ class MelDataset(torch.utils.data.Dataset):
         if not self.synthetic_enabled:
             return self._base_length
         return self._base_length + self._synthetic_count
+
+    # ------------------------------------------------------------------
+    # Augmentation helpers
+    def _initialise_augmentation_settings(self):
+        config = self.augmentation_config if isinstance(self.augmentation_config, dict) else {}
+
+        default_amp = 0.2 if self.data_augmentation else 0.0
+        self._amplitude_jitter = max(0.0, float(config.get('amplitude_jitter', default_amp)))
+
+        noise_cfg = config.get('noise', {}) or {}
+        db_range = noise_cfg.get('db_range', (-35.0, -25.0))
+        if not isinstance(db_range, (list, tuple)) or len(db_range) != 2:
+            db_range = (-35.0, -25.0)
+        low, high = float(db_range[0]), float(db_range[1])
+        if low > high:
+            low, high = high, low
+        self._noise_db_range = (low, high)
+        noise_prob = float(noise_cfg.get('probability', 0.8 if self.data_augmentation else 0.0))
+        self._noise_prob = min(max(noise_prob, 0.0), 1.0)
+
+        rir_cfg = config.get('rir', {}) or {}
+        rir_prob = float(rir_cfg.get('probability', 0.5 if self.data_augmentation else 0.0))
+        self._rir_prob = min(max(rir_prob, 0.0), 1.0)
+        self._rir_max_length_seconds = float(rir_cfg.get('max_length_seconds', 0.05))
+        self._rir_min_decay = float(rir_cfg.get('min_decay', 10.0))
+        self._rir_max_decay = float(rir_cfg.get('max_decay', 40.0))
+        if self._rir_min_decay > self._rir_max_decay:
+            self._rir_min_decay, self._rir_max_decay = self._rir_max_decay, self._rir_min_decay
+        self._rir_max_reflections = int(max(0, rir_cfg.get('max_reflections', 3)))
+        self._rir_max_reflection_gain = float(rir_cfg.get('max_reflection_gain', 0.3))
+
+        spec_cfg = config.get('spec_augment', {}) or {}
+        spec_prob = float(spec_cfg.get('probability', 1.0 if self.data_augmentation else 0.0))
+        self._spec_augment_prob = min(max(spec_prob, 0.0), 1.0)
+        self._spec_time_masks = int(max(0, spec_cfg.get('time_masks', 1)))
+        self._spec_freq_masks = int(max(0, spec_cfg.get('freq_masks', 1)))
+        self._spec_max_time = int(max(1, spec_cfg.get('max_time_width', 32)))
+        self._spec_max_freq = int(max(1, spec_cfg.get('max_freq_width', 8)))
+
+        if not self.data_augmentation:
+            self._noise_prob = 0.0
+            self._rir_prob = 0.0
+            self._spec_augment_prob = 0.0
+
+    def _apply_waveform_augmentations(self, waveform, sr):
+        augmented = np.asarray(waveform, dtype=np.float32)
+        if augmented.size == 0:
+            return augmented
+
+        original_shape = augmented.shape
+        if augmented.ndim == 1:
+            augmented = augmented[:, np.newaxis]
+
+        if self._rir_prob > 0.0 and random.random() < self._rir_prob:
+            augmented = self._apply_random_rir(augmented, sr)
+
+        if self._amplitude_jitter > 0.0:
+            jitter = 1.0 + random.uniform(-self._amplitude_jitter, self._amplitude_jitter)
+            augmented = augmented * float(jitter)
+
+        if self._noise_prob > 0.0 and random.random() < self._noise_prob:
+            augmented = self._apply_low_level_noise(augmented)
+
+        np.clip(augmented, -1.0, 1.0, out=augmented)
+
+        if original_shape != augmented.shape:
+            augmented = np.reshape(augmented, original_shape)
+
+        return augmented.astype(np.float32)
+
+    def _apply_random_rir(self, waveform, sr):
+        samples = waveform.shape[0]
+        rir_length = int(max(1, round(self._rir_max_length_seconds * float(sr))))
+        if rir_length <= 1:
+            return waveform
+
+        rir = np.zeros(rir_length, dtype=np.float32)
+        rir[0] = 1.0
+
+        max_reflections = max(0, self._rir_max_reflections)
+        if max_reflections > 0:
+            num_reflections = random.randint(1, max_reflections)
+        else:
+            num_reflections = 0
+
+        for _ in range(num_reflections):
+            delay = random.randint(1, rir_length - 1)
+            decay = random.uniform(self._rir_min_decay, self._rir_max_decay)
+            amplitude = random.uniform(0.05, max(0.05, self._rir_max_reflection_gain))
+            sign = 1.0 if random.random() < 0.5 else -1.0
+            tail_length = rir_length - delay
+            time = np.arange(tail_length, dtype=np.float32)
+            envelope = np.exp(-decay * time / float(max(sr, 1)))
+            rir[delay:] += sign * amplitude * envelope
+
+        max_abs = np.max(np.abs(rir))
+        if max_abs > 0:
+            rir /= max_abs
+
+        convolved = np.zeros_like(waveform)
+        for channel in range(waveform.shape[1]):
+            convolved[:, channel] = np.convolve(waveform[:, channel], rir, mode='full')[:samples]
+
+        return convolved
+
+    def _apply_low_level_noise(self, waveform):
+        noise = np.random.randn(*waveform.shape).astype(np.float32)
+        signal_rms = np.sqrt(np.maximum(np.mean(np.square(waveform), axis=0), 1e-8))
+        noise_rms = np.sqrt(np.maximum(np.mean(np.square(noise), axis=0), 1e-8))
+        target_db = random.uniform(self._noise_db_range[0], self._noise_db_range[1])
+        target_ratio = 10.0 ** (target_db / 20.0)
+        target_noise_rms = signal_rms * target_ratio
+        scale = target_noise_rms / noise_rms
+        noise *= scale
+        return waveform + noise
+
+    def _apply_spec_augment(self, mel_tensor):
+        if self._spec_augment_prob <= 0.0 or random.random() > self._spec_augment_prob:
+            return mel_tensor
+
+        augmented = mel_tensor.clone()
+        num_mels, num_frames = augmented.shape
+
+        if self._spec_freq_masks > 0 and num_mels > 0:
+            max_width = min(num_mels, self._spec_max_freq)
+            mean_value = torch.mean(augmented)
+            for _ in range(self._spec_freq_masks):
+                width = random.randint(0, max_width)
+                if width == 0 or width > num_mels:
+                    continue
+                start = random.randint(0, num_mels - width)
+                augmented[start:start + width, :] = mean_value
+
+        if self._spec_time_masks > 0 and num_frames > 0:
+            max_width = min(num_frames, self._spec_max_time)
+            mean_value = torch.mean(augmented)
+            for _ in range(self._spec_time_masks):
+                width = random.randint(0, max_width)
+                if width == 0 or width > num_frames:
+                    continue
+                start = random.randint(0, num_frames - width)
+                augmented[:, start:start + width] = mean_value
+
+        return augmented
 
     # ------------------------------------------------------------------
     # Multiprocessing support helpers
@@ -230,8 +377,7 @@ class MelDataset(torch.utils.data.Dataset):
         )
 
         if self.data_augmentation:
-            random_scale = 0.5 + 0.5 * np.random.random()
-            waveform = random_scale * waveform
+            waveform = self._apply_waveform_augmentations(waveform, wave_sr)
 
         cache_key = path if use_full_file else None
         allow_cache = (not self.data_augmentation) and use_full_file
@@ -647,7 +793,10 @@ class MelDataset(torch.utils.data.Dataset):
                     expected_metadata = self._build_mel_metadata(wave_tensor, sr)
                 self._save_mel_cache(cache_key, mel_tensor, expected_metadata)
 
-        mel_tensor = (torch.log(1e-5 + mel_tensor) - self.mean) / self.std
+        mel_tensor = torch.log(1e-5 + mel_tensor)
+        if self.data_augmentation:
+            mel_tensor = self._apply_spec_augment(mel_tensor)
+        mel_tensor = (mel_tensor - self.mean) / self.std
         mel_length = mel_tensor.size(1)
 
         if f0 is None:

@@ -46,6 +46,25 @@ dataset_params:
     n_fft: 1024
     n_mels: 80
     hop_length: 300
+  data_augmentation: true
+  augmentation_config:
+    amplitude_jitter: 0.2
+    noise:
+      probability: 0.8
+      db_range: [-35.0, -25.0]
+    rir:
+      probability: 0.5
+      max_length_seconds: 0.05
+      min_decay: 10.0
+      max_decay: 40.0
+      max_reflections: 3
+      max_reflection_gain: 0.3
+    spec_augment:
+      probability: 1.0
+      time_masks: 1
+      max_time_width: 32
+      freq_masks: 1
+      max_freq_width: 8
   # Optional DataLoader overrides. Leave fields as null to accept the defaults.
   # When left unspecified the loader automatically switches to ``start_method:
   # spawn`` whenever a CUDA-enabled F0 backend is active so GPU extraction works

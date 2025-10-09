@@ -75,7 +75,28 @@ Whenever the backend configuration changes the dataset automatically regenerates
 The optional `dataset_params.dataloader` dictionary lets you fine-tune how the `DataLoader` is constructed (for example, setting `start_method`, `persistent_workers`, or `prefetch_factor`). When omitted the builder keeps PyTorch defaults, only forcing `start_method: spawn` when CUDA-enabled F0 backends would otherwise hit the "Cannot re-initialize CUDA in forked subprocess" error.
 
 ### Data Augmentation
-Data augmentation is not included in this code. For better voice conversion results, please add your own data augmentation in [meldataset.py](https://github.com/yl4579/PitchExtractor/blob/main/meldataset.py) with [audiomentations](https://github.com/iver56/audiomentations).
+When `dataset_params.data_augmentation` is enabled the loader now applies
+pitch-preserving augmentations that improve robustness without invalidating the
+F0 supervision. Waveform-level transforms add a light room impulse response and
+inject narrow-band noise around −35…−25 dB relative to the signal, while the
+log-mel spectrogram receives a "SpecAugment-light" treatment (single time and
+frequency masks). All operations keep the sample rate unchanged so the cached
+pitch tracks remain valid.
+
+Tweak the behaviour through `dataset_params.augmentation_config` in
+[Configs/config.yml](Configs/config.yml). The defaults enable:
+
+- **Amplitude jitter** – Random gain within ±20% to emulate level variations.
+- **Room impulse responses** – Short, low-energy reflections applied with 50%
+  probability; adjust duration/decay parameters for stronger or weaker rooms.
+- **Low-level noise** – Gaussian noise injected with 80% probability at an SNR
+  drawn uniformly from the configured dB range.
+- **SpecAugment** – One time mask (up to 32 frames) and one frequency mask (up
+  to 8 mel bins) filled with the spectrogram mean.
+
+You can disable any component by lowering its probability to zero or by turning
+off `data_augmentation` entirely (validation splits automatically skip all
+augmentations).
 
 ### Synthetic pitch-calibrated data
 The dataloader can optionally blend in synthetic utterances whose pitch is known
