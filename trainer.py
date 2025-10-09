@@ -58,7 +58,7 @@ class Trainer(object):
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.config = config
-        self.loss_config = loss_config
+        self.loss_config = loss_config or {}
         self.device = device
         self.finish_train = False
         self.logger = logger
@@ -279,17 +279,40 @@ class Trainer(object):
             for ema_buffer, model_buffer in zip(ema_buffers, model_buffers):
                 ema_buffer.copy_(model_buffer)
 
+    def _f0_to_loss_scale(self, f0_values):
+        """Convert F0 values to the configured regression scale."""
+
+        scale_type = str(self.loss_config.get('f0_loss_scale', 'log_hz')).lower()
+        if scale_type in {'log_hz', 'log-hz', 'loghz', 'log'}:
+            min_hz = float(self.loss_config.get('f0_log_min_hz', 1e-2))
+            clamp_min = torch.tensor(min_hz, dtype=f0_values.dtype, device=f0_values.device)
+            safe_values = torch.maximum(f0_values, clamp_min)
+            return torch.log(safe_values)
+        if scale_type in {'cents', 'cent'}:
+            min_hz = float(self.loss_config.get('f0_log_min_hz', 1e-2))
+            reference_hz = float(self.loss_config.get('f0_cents_reference_hz', 10.0))
+            clamp_min = torch.tensor(min_hz, dtype=f0_values.dtype, device=f0_values.device)
+            safe_values = torch.maximum(f0_values, clamp_min)
+            reference = torch.tensor(reference_hz, dtype=f0_values.dtype, device=f0_values.device)
+            return 1200.0 * torch.log2(safe_values / reference)
+        if scale_type in {'linear_hz', 'hz', 'linear'}:
+            return f0_values
+        raise ValueError(f"Unsupported F0 loss scale: {scale_type}")
+
     def _compute_f0_loss(self, f0_pred, f0_target, silence_labels):
         """Compute the F0 regression loss masked to voiced frames only."""
 
         if f0_pred.dim() > f0_target.dim():
             f0_pred = f0_pred.squeeze(-1)
         voiced_mask = (silence_labels < 0.5).to(f0_pred.dtype)
-        l1_per_frame = self.criterion['l1'](f0_pred, f0_target)
-        masked_l1 = l1_per_frame * voiced_mask
+        pred_in_scale = self._f0_to_loss_scale(f0_pred)
+        target_in_scale = self._f0_to_loss_scale(f0_target)
+        loss_per_frame = self.criterion['f0'](pred_in_scale, target_in_scale)
+        masked_loss = loss_per_frame * voiced_mask
         normaliser = voiced_mask.sum().clamp_min(1.0)
-        loss_f0 = masked_l1.sum() / normaliser
-        return self.loss_config['lambda_f0'] * loss_f0
+        loss_f0 = masked_loss.sum() / normaliser
+        lambda_f0 = float(self.loss_config.get('lambda_f0', 1.0))
+        return lambda_f0 * loss_f0
 
     def run(self, batch):
         self.optimizer.zero_grad(set_to_none=True)

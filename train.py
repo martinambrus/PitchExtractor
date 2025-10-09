@@ -101,11 +101,13 @@ def main(config_path):
     optimizer, scheduler = build_optimizer(
         {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
 
-    criterion = {'l1': nn.SmoothL1Loss(reduction='none'), # F0 loss (regression)
-                 'ce':  nn.BCEWithLogitsLoss() # silence loss (binary classification)
-                }
+    loss_config = config.get('loss_params', {})
+    f0_delta = float(loss_config.get('f0_huber_delta', 0.075))
 
-    loss_config = config['loss_params']
+    criterion = {
+        'f0': nn.SmoothL1Loss(reduction='none', beta=f0_delta),  # F0 loss (regression)
+        'ce': nn.BCEWithLogitsLoss()  # silence loss (binary classification)
+    }
 
     trainer = Trainer(model=model,
                         criterion=criterion,
