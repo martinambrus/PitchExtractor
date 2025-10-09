@@ -32,6 +32,14 @@ Please specify the training and validation data in `config.yml` file. The data l
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take.
 
+During validation the trainer now automatically calibrates the voiced/unvoiced
+decision threshold by sweeping possible values on the held-out set and picking
+the one that maximises the F1 score. The resulting threshold is reused for the
+F0 loss mask and the reported V/UV metrics so evaluation mirrors the behaviour
+seen at inference time. You can override the initial guess (`vuv_initial_threshold`)
+and the resolution of the sweep (`vuv_calibration_steps`) from the `loss_params`
+section of [`Configs/config.yml`](Configs/config.yml) when needed.
+
 ### Loss weighting sweeps
 The total objective is formulated as `L_total = L_f0 + λ · L_vuv`, where `L_vuv`
 is the voiced/unvoiced (silence) classification loss. You can explore different

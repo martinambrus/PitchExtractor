@@ -61,9 +61,18 @@ class Trainer(object):
         self.logger = logger
         self.loss_config = loss_config or {}
         self.lambda_vuv = float(self.loss_config.get("lambda_vuv", 1.0))
+        self.vuv_threshold = float(self.loss_config.get("vuv_initial_threshold", 0.5))
+        self.vuv_calibration_steps = int(self.loss_config.get("vuv_calibration_steps", 201))
+        if self.vuv_calibration_steps < 2:
+            self.vuv_calibration_steps = 2
         if self.logger is not None:
             try:
                 self.logger.info("Using lambda_vuv=%.4f for voiced/unvoiced loss", self.lambda_vuv)
+                self.logger.info(
+                    "Initial voiced/unvoiced threshold set to %.4f (calibration steps: %d)",
+                    self.vuv_threshold,
+                    self.vuv_calibration_steps,
+                )
             except Exception:
                 # Logger may not be fully initialised in some unit tests; fail silently.
                 pass
@@ -306,20 +315,119 @@ class Trainer(object):
             return f0_values
         raise ValueError(f"Unsupported F0 loss scale: {scale_type}")
 
-    def _compute_f0_loss(self, f0_pred, f0_target, silence_labels):
+    def _compute_f0_loss(self, f0_pred, f0_target, silence_labels=None, voicing_probs=None, threshold=None):
         """Compute the F0 regression loss masked to voiced frames only."""
+
+        if threshold is None:
+            threshold = float(self.vuv_threshold)
+        else:
+            threshold = float(threshold)
 
         if f0_pred.dim() > f0_target.dim():
             f0_pred = f0_pred.squeeze(-1)
-        voiced_mask = (silence_labels < 0.5).to(f0_pred.dtype)
+        if f0_target.dim() > f0_pred.dim():
+            f0_target = f0_target.squeeze(-1)
+        if voicing_probs is not None and voicing_probs.dim() > f0_pred.dim():
+            voicing_probs = voicing_probs.squeeze(-1)
+        if silence_labels is not None and silence_labels.dim() > f0_pred.dim():
+            silence_labels = silence_labels.squeeze(-1)
+
+        voiced_mask = None
+        if voicing_probs is not None:
+            if not isinstance(voicing_probs, torch.Tensor):
+                raise TypeError("voicing_probs must be a torch.Tensor when provided")
+            mask = (voicing_probs >= threshold).to(f0_pred.dtype)
+            if mask.sum() < 1.0 and silence_labels is not None:
+                fallback_mask = (silence_labels < 0.5).to(f0_pred.dtype)
+                if fallback_mask.sum() >= 1.0:
+                    mask = fallback_mask
+            voiced_mask = mask
+        elif silence_labels is not None:
+            voiced_mask = (silence_labels < 0.5).to(f0_pred.dtype)
+        else:
+            voiced_mask = torch.ones_like(f0_pred, dtype=f0_pred.dtype)
+
+        while voiced_mask.dim() < f0_pred.dim():
+            voiced_mask = voiced_mask.unsqueeze(-1)
+
         pred_in_scale = self._f0_to_loss_scale(f0_pred)
         target_in_scale = self._f0_to_loss_scale(f0_target)
         loss_per_frame = self.criterion['f0'](pred_in_scale, target_in_scale)
+        if loss_per_frame.shape != voiced_mask.shape:
+            voiced_mask = voiced_mask.expand_as(loss_per_frame)
         masked_loss = loss_per_frame * voiced_mask
         normaliser = voiced_mask.sum().clamp_min(1.0)
         loss_f0 = masked_loss.sum() / normaliser
         lambda_f0 = float(self.loss_config.get('lambda_f0', 1.0))
         return lambda_f0 * loss_f0
+
+    def _compute_vuv_metrics_from_arrays(self, voiced_probs, positive_mask, threshold):
+        preds = voiced_probs >= threshold
+        positive_mask = positive_mask.astype(bool)
+        preds = preds.astype(bool)
+        tp = np.count_nonzero(preds & positive_mask)
+        fp = np.count_nonzero(preds & (~positive_mask))
+        fn = np.count_nonzero((~preds) & positive_mask)
+        tn = positive_mask.size - tp - fp - fn
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        if (precision + recall) > 0:
+            f1 = 2.0 * precision * recall / (precision + recall)
+        else:
+            f1 = 0.0
+        accuracy = (tp + tn) / positive_mask.size if positive_mask.size > 0 else 0.0
+
+        return {
+            "eval/vuv_precision": float(precision),
+            "eval/vuv_recall": float(recall),
+            "eval/vuv_f1": float(f1),
+            "eval/vuv_accuracy": float(accuracy),
+        }
+
+    def _calibrate_vuv_threshold(self, voiced_prob_batches, silence_label_batches):
+        default_metrics = {
+            "eval/vuv_precision": 0.0,
+            "eval/vuv_recall": 0.0,
+            "eval/vuv_f1": 0.0,
+            "eval/vuv_accuracy": 0.0,
+        }
+
+        if not voiced_prob_batches or not silence_label_batches:
+            return None, default_metrics
+
+        voiced_probs = torch.cat([batch.reshape(-1) for batch in voiced_prob_batches], dim=0).to(torch.float32)
+        silence_labels = torch.cat([batch.reshape(-1) for batch in silence_label_batches], dim=0).to(torch.float32)
+
+        if voiced_probs.numel() == 0:
+            return None, default_metrics
+
+        voiced_probs_np = voiced_probs.numpy()
+        voiced_targets_np = (1.0 - silence_labels.numpy())
+
+        positive_mask = voiced_targets_np >= 0.5
+        if positive_mask.size == 0:
+            return float(self.vuv_threshold), default_metrics.copy()
+
+        thresholds = np.linspace(0.0, 1.0, num=self.vuv_calibration_steps)
+        thresholds = np.unique(np.concatenate([thresholds, [self.vuv_threshold]]))
+
+        best_threshold = float(self.vuv_threshold)
+        best_metrics = self._compute_vuv_metrics_from_arrays(voiced_probs_np, positive_mask, best_threshold)
+        best_f1 = best_metrics["eval/vuv_f1"]
+
+        for thr in thresholds:
+            metrics = self._compute_vuv_metrics_from_arrays(voiced_probs_np, positive_mask, thr)
+            f1_score = metrics["eval/vuv_f1"]
+            if f1_score > best_f1 + 1e-9 or (
+                abs(f1_score - best_f1) <= 1e-9
+                and abs(thr - self.vuv_threshold) < abs(best_threshold - self.vuv_threshold)
+            ):
+                best_threshold = float(thr)
+                best_metrics = metrics
+                best_f1 = f1_score
+
+        return best_threshold, best_metrics
 
     def run(self, batch):
         self.optimizer.zero_grad(set_to_none=True)
@@ -339,7 +447,13 @@ class Trainer(object):
             else:
                 f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
-            loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
+            voicing_probs = torch.sigmoid(-sil_pred)
+            loss_f0 = self._compute_f0_loss(
+                f0_pred,
+                f0,
+                silence_labels=sil,
+                voicing_probs=voicing_probs.detach(),
+            )
             loss_sil_raw = self.criterion['ce'](sil_pred, sil)
             loss_sil = self.lambda_vuv * loss_sil_raw
             loss = loss_f0 + loss_sil
@@ -378,8 +492,12 @@ class Trainer(object):
         base_model_training = self.model.training
         eval_model_training = eval_model.training
         eval_model.eval()
-        eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
+        f0_batches = []
+        voicing_prob_batches = []
+        silence_label_batches = []
+        silence_losses = []
+
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
             batch = [b.to(self.device, non_blocking=True) for b in batch]
             x, f0, sil = batch
@@ -388,18 +506,71 @@ class Trainer(object):
             with autocast_context():
                 f0_pred, sil_pred = eval_model(x.transpose(-1, -2))
 
-                loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
-                loss_sil_raw = self.criterion['ce'](sil_pred, sil)
-                loss_sil = self.lambda_vuv * loss_sil_raw
-                loss = loss_f0 + loss_sil
+            voicing_probs = torch.sigmoid(-sil_pred)
+            f0_batches.append((f0_pred.detach().cpu().float(), f0.detach().cpu().float()))
+            voicing_prob_batches.append(voicing_probs.detach().cpu().float())
+            silence_label_batches.append(sil.detach().cpu().float())
 
+            loss_sil_raw = self.criterion['ce'](sil_pred, sil)
+            silence_losses.append(loss_sil_raw.item())
 
-            eval_losses["eval/loss"].append(loss.item())
-            eval_losses["eval/f0"].append(loss_f0.item())
-            eval_losses["eval/sil"].append(loss_sil_raw.item())
-            eval_losses["eval/sil_weighted"].append(loss_sil.item())
+        eval_losses = {}
 
-        eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
+        if silence_losses:
+            mean_silence = float(np.mean(silence_losses))
+        else:
+            mean_silence = 0.0
+
+        mean_silence_weighted = float(self.lambda_vuv * mean_silence)
+
+        metrics = {}
+        if voicing_prob_batches:
+            new_threshold, metrics = self._calibrate_vuv_threshold(voicing_prob_batches, silence_label_batches)
+            if new_threshold is not None and not np.isclose(new_threshold, self.vuv_threshold):
+                previous_threshold = self.vuv_threshold
+                self.vuv_threshold = float(new_threshold)
+                if self.logger is not None:
+                    try:
+                        self.logger.info(
+                            "Updated V/UV threshold from %.4f to %.4f after calibration",
+                            previous_threshold,
+                            self.vuv_threshold,
+                        )
+                    except Exception:
+                        pass
+        else:
+            metrics = {
+                "eval/vuv_f1": 0.0,
+                "eval/vuv_precision": 0.0,
+                "eval/vuv_recall": 0.0,
+                "eval/vuv_accuracy": 0.0,
+            }
+
+        metrics["eval/vuv_threshold"] = float(self.vuv_threshold)
+
+        f0_losses = []
+        for (f0_pred_cpu, f0_target_cpu), probs_cpu, sil_cpu in zip(f0_batches, voicing_prob_batches, silence_label_batches):
+            loss_value = self._compute_f0_loss(
+                f0_pred_cpu,
+                f0_target_cpu,
+                silence_labels=sil_cpu,
+                voicing_probs=probs_cpu,
+                threshold=self.vuv_threshold,
+            )
+            f0_losses.append(loss_value.item())
+
+        if f0_losses:
+            mean_f0 = float(np.mean(f0_losses))
+        else:
+            mean_f0 = 0.0
+
+        total_loss = float(mean_f0 + mean_silence_weighted)
+
+        eval_losses["eval/loss"] = total_loss
+        eval_losses["eval/f0"] = mean_f0
+        eval_losses["eval/sil"] = mean_silence
+        eval_losses["eval/sil_weighted"] = mean_silence_weighted
+        eval_losses.update(metrics)
         eval_losses.update(eval_images)
         eval_model.train(eval_model_training)
         self.model.train(base_model_training)
