@@ -10,6 +10,7 @@ import re
 import sys
 import yaml
 import shutil
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,18 +43,14 @@ def get_data_path_list(train_path=None, val_path=None):
     # val_list = train_list[:500]
     return train_list, val_list
 
-@click.command()
-@click.option('-p', '--config_path', default='./Configs/config.yml', type=str)
-def main(config_path):
-    config = yaml.safe_load(open(config_path))
-    log_dir = config['log_dir']
-    if not osp.exists(log_dir): os.mkdir(log_dir)
-    shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+def _train_single_run(config, config_path, run_log_dir):
+    os.makedirs(run_log_dir, exist_ok=True)
+    shutil.copy(config_path, osp.join(run_log_dir, osp.basename(config_path)))
 
-    writer = SummaryWriter(log_dir + "/tensorboard")
+    writer = SummaryWriter(run_log_dir + "/tensorboard")
 
     # write logs
-    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
+    file_handler = logging.FileHandler(osp.join(run_log_dir, 'train.log'))
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.addHandler(file_handler)
@@ -69,18 +66,19 @@ def main(config_path):
 
     train_list, val_list = get_data_path_list(train_path, val_path)
 
+    dataset_config = config.get('dataset_params', {})
     train_dataloader = build_dataloader(train_list,
                                         batch_size=batch_size,
                                         num_workers=num_workers,
-                                        dataset_config=config.get('dataset_params', {}),
+                                        dataset_config=dataset_config,
                                         device=device)
 
     val_dataloader = build_dataloader(val_list,
                                       batch_size=batch_size,
                                       validation=True,
-                                      num_workers=num_workers // 2,
+                                      num_workers=max(1, num_workers // 2),
                                       device=device,
-                                      dataset_config=config.get('dataset_params', {}))
+                                      dataset_config=dataset_config)
 
     # define model
     model_config = config.get('model_params', {})
@@ -149,13 +147,42 @@ def main(config_path):
             else:
                 writer.add_figure(key, (v), epoch)
         if (epoch % save_freq) == 0:
-            trainer.save_checkpoint(osp.join(log_dir, 'epoch_%05d.pth' % epoch))
+            trainer.save_checkpoint(osp.join(run_log_dir, 'epoch_%05d.pth' % epoch))
 
         eval_loss = eval_results.get('eval/loss')
         if eval_loss is not None and eval_loss < best_eval_loss:
             best_eval_loss = eval_loss
             logger.info('New best model with eval/loss %.4f', best_eval_loss)
-            trainer.save_checkpoint(osp.join(log_dir, 'best.pth'), use_ema_model=True)
+            trainer.save_checkpoint(osp.join(run_log_dir, 'best.pth'), use_ema_model=True)
+
+    writer.close()
+    logger.removeHandler(file_handler)
+    file_handler.close()
+
+
+@click.command()
+@click.option('-p', '--config_path', default='./Configs/config.yml', type=str)
+def main(config_path):
+    config = yaml.safe_load(open(config_path))
+    config.setdefault('log_dir', 'Checkpoint')
+    loss_params = copy.deepcopy(config.get('loss_params', {}))
+    lambda_candidates = loss_params.pop('lambda_vuv_candidates', None)
+
+    if lambda_candidates:
+        base_log_dir = config.get('log_dir', 'Checkpoint')
+        os.makedirs(base_log_dir, exist_ok=True)
+        for candidate in lambda_candidates:
+            candidate_value = float(candidate)
+            candidate_config = copy.deepcopy(config)
+            candidate_config['log_dir'] = osp.join(base_log_dir, f"lambda_vuv_{candidate_value:g}")
+            candidate_config.setdefault('loss_params', {})['lambda_vuv'] = candidate_value
+            candidate_config['loss_params'].pop('lambda_vuv_candidates', None)
+            _train_single_run(candidate_config, config_path, candidate_config['log_dir'])
+    else:
+        config.setdefault('loss_params', {})
+        config['loss_params']['lambda_vuv'] = float(config['loss_params'].get('lambda_vuv', 1.0))
+        config['loss_params'].pop('lambda_vuv_candidates', None)
+        _train_single_run(config, config_path, config['log_dir'])
 
     return 0
 

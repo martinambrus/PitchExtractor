@@ -30,6 +30,11 @@ optimizer_params:
   
 loss_params:
   lambda_f0: 0.1
+  lambda_vuv: 0.5
+  lambda_vuv_candidates:
+    - 0.25
+    - 0.5
+    - 1.0
   f0_loss_scale: log_hz
   f0_huber_delta: 0.075
   f0_log_min_hz: 1.0
