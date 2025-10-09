@@ -136,6 +136,10 @@ def _train_single_run(config, config_path, run_log_dir):
     print('All F0 data is computed.')
 
     best_eval_loss = float('inf')
+    best_epoch = None
+    patience = int(training_config.get('early_stopping_patience', 5))
+    patience = max(patience, 0)
+    epochs_without_improvement = 0
     for epoch in range(1, epochs+1):
         train_results = trainer._train_epoch()
         eval_results = trainer._eval_epoch()
@@ -152,10 +156,27 @@ def _train_single_run(config, config_path, run_log_dir):
             trainer.save_checkpoint(osp.join(run_log_dir, 'epoch_%05d.pth' % epoch))
 
         eval_loss = eval_results.get('eval/loss')
-        if eval_loss is not None and eval_loss < best_eval_loss:
+        improved = False
+        if eval_loss is None:
+            if patience > 0:
+                logger.warning('eval/loss metric is missing; skipping early stopping check for this epoch.')
+        elif eval_loss < best_eval_loss:
             best_eval_loss = eval_loss
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            improved = True
             logger.info('New best model with eval/loss %.4f', best_eval_loss)
             trainer.save_checkpoint(osp.join(run_log_dir, 'best.pth'), use_ema_model=True)
+        else:
+            epochs_without_improvement += 1
+
+        if not improved and eval_loss is not None and patience > 0 and epochs_without_improvement >= patience:
+            logger.info(
+                'Early stopping triggered after %d epochs without improvement (best eval/loss %.4f at epoch %s).',
+                epochs_without_improvement,
+                best_eval_loss,
+                best_epoch if best_epoch is not None else 'N/A')
+            break
 
     writer.close()
     logger.removeHandler(file_handler)
