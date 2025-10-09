@@ -58,10 +58,17 @@ class Trainer(object):
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.config = config
+        self.logger = logger
         self.loss_config = loss_config or {}
+        self.lambda_vuv = float(self.loss_config.get("lambda_vuv", 1.0))
+        if self.logger is not None:
+            try:
+                self.logger.info("Using lambda_vuv=%.4f for voiced/unvoiced loss", self.lambda_vuv)
+            except Exception:
+                # Logger may not be fully initialised in some unit tests; fail silently.
+                pass
         self.device = device
         self.finish_train = False
-        self.logger = logger
         device_type = torch.device(self.device).type if isinstance(self.device, (str, torch.device)) else "cpu"
         self.use_amp = bool(use_mixed_precision and device_type == "cuda")
         if TorchGradScaler is not None:
@@ -333,7 +340,8 @@ class Trainer(object):
                 f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
             loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
-            loss_sil = self.criterion['ce'](sil_pred, sil)
+            loss_sil_raw = self.criterion['ce'](sil_pred, sil)
+            loss_sil = self.lambda_vuv * loss_sil_raw
             loss = loss_f0 + loss_sil
 
         if self.use_amp:
@@ -348,7 +356,8 @@ class Trainer(object):
 
         return {'loss': loss.item(),
                 'f0': loss_f0.item(),
-                'sil': loss_sil.item()}
+                'sil': loss_sil_raw.item(),
+                'sil_weighted': loss_sil.item()}
 
     def _train_epoch(self):
         self.epochs += 1
@@ -380,13 +389,15 @@ class Trainer(object):
                 f0_pred, sil_pred = eval_model(x.transpose(-1, -2))
 
                 loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
-                loss_sil = self.criterion['ce'](sil_pred, sil)
+                loss_sil_raw = self.criterion['ce'](sil_pred, sil)
+                loss_sil = self.lambda_vuv * loss_sil_raw
                 loss = loss_f0 + loss_sil
 
 
             eval_losses["eval/loss"].append(loss.item())
             eval_losses["eval/f0"].append(loss_f0.item())
-            eval_losses["eval/sil"].append(loss_sil.item())
+            eval_losses["eval/sil"].append(loss_sil_raw.item())
+            eval_losses["eval/sil_weighted"].append(loss_sil.item())
 
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)

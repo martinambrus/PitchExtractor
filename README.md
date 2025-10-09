@@ -32,6 +32,17 @@ Please specify the training and validation data in `config.yml` file. The data l
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take.
 
+### Loss weighting sweeps
+The total objective is formulated as `L_total = L_f0 + λ · L_vuv`, where `L_vuv`
+is the voiced/unvoiced (silence) classification loss. You can explore different
+values of `λ` by editing the `loss_params` block in
+[`Configs/config.yml`](Configs/config.yml). When
+`lambda_vuv_candidates` contains more than one value the training script will
+automatically launch one experiment per candidate, saving checkpoints under
+`<log_dir>/lambda_vuv_<value>`. The default configuration tries `λ ∈ {0.25, 0.5,
+1.0}` with a base weight of `lambda_vuv = 0.5`. Remove or empty the candidate
+list if you only wish to run a single setting.
+
 ### Mixed precision and memory optimisations
 When running on CUDA the trainer now enables automatic mixed precision (AMP) and gradient scaling by default, significantly reducing VRAM usage while taking advantage of Tensor Cores. You can control this behaviour via the `training` section of [`Configs/config.yml`](Configs/config.yml): set `mixed_precision` to `false` to force full FP32 training or flip `gradient_checkpointing` to `true` if you want to trade a small amount of compute for lower activation memory during the forward pass. When checkpointing is active you can also decide whether to use the legacy re-entrant autograd path by toggling `gradient_checkpointing_use_reentrant` (defaults to the recommended `false` on recent PyTorch releases and automatically falls back when the flag is unsupported).
 
