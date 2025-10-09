@@ -279,6 +279,18 @@ class Trainer(object):
             for ema_buffer, model_buffer in zip(ema_buffers, model_buffers):
                 ema_buffer.copy_(model_buffer)
 
+    def _compute_f0_loss(self, f0_pred, f0_target, silence_labels):
+        """Compute the F0 regression loss masked to voiced frames only."""
+
+        if f0_pred.dim() > f0_target.dim():
+            f0_pred = f0_pred.squeeze(-1)
+        voiced_mask = (silence_labels < 0.5).to(f0_pred.dtype)
+        l1_per_frame = self.criterion['l1'](f0_pred, f0_target)
+        masked_l1 = l1_per_frame * voiced_mask
+        normaliser = voiced_mask.sum().clamp_min(1.0)
+        loss_f0 = masked_l1.sum() / normaliser
+        return self.loss_config['lambda_f0'] * loss_f0
+
     def run(self, batch):
         self.optimizer.zero_grad(set_to_none=True)
         batch = [b.to(self.device, non_blocking=True) for b in batch]
@@ -297,7 +309,7 @@ class Trainer(object):
             else:
                 f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
-            loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
+            loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
             loss_sil = self.criterion['ce'](sil_pred, sil)
             loss = loss_f0 + loss_sil
 
@@ -344,7 +356,7 @@ class Trainer(object):
             with autocast_context():
                 f0_pred, sil_pred = eval_model(x.transpose(-1, -2))
 
-                loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
+                loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
                 loss_sil = self.criterion['ce'](sil_pred, sil)
                 loss = loss_f0 + loss_sil
 

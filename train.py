@@ -101,7 +101,7 @@ def main(config_path):
     optimizer, scheduler = build_optimizer(
         {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
 
-    criterion = {'l1': nn.SmoothL1Loss(), # F0 loss (regression)
+    criterion = {'l1': nn.SmoothL1Loss(reduction='none'), # F0 loss (regression)
                  'ce':  nn.BCEWithLogitsLoss() # silence loss (binary classification)
                 }
 
