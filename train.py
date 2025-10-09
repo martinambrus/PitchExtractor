@@ -118,7 +118,8 @@ def main(config_path):
                         logger=logger,
                         use_mixed_precision=training_config.get('mixed_precision', True),
                         gradient_checkpointing=training_config.get('gradient_checkpointing', False),
-                        checkpoint_use_reentrant=training_config.get('gradient_checkpointing_use_reentrant'))
+                        checkpoint_use_reentrant=training_config.get('gradient_checkpointing_use_reentrant'),
+                        ema_decay=training_config.get('ema_decay', 0.0))
 
     if config.get('pretrained_model', '') != '':
         trainer.load_checkpoint(config['pretrained_model'],
@@ -132,20 +133,27 @@ def main(config_path):
         continue
     print('All F0 data is computed.')
 
+    best_eval_loss = float('inf')
     for epoch in range(1, epochs+1):
-            train_results = trainer._train_epoch()
-            eval_results = trainer._eval_epoch()
-            results = train_results.copy()
-            results.update(eval_results)
-            logger.info('--- epoch %d ---' % epoch)
-            for key, value in results.items():
-                if isinstance(value, float):
-                    logger.info('%-15s: %.4f' % (key, value))
-                    writer.add_scalar(key, value, epoch)
-                else:
-                    writer.add_figure(key, (v), epoch)
-            if (epoch % save_freq) == 0:
-                trainer.save_checkpoint(osp.join(log_dir, 'epoch_%05d.pth' % epoch))
+        train_results = trainer._train_epoch()
+        eval_results = trainer._eval_epoch()
+        results = train_results.copy()
+        results.update(eval_results)
+        logger.info('--- epoch %d ---' % epoch)
+        for key, value in results.items():
+            if isinstance(value, float):
+                logger.info('%-15s: %.4f' % (key, value))
+                writer.add_scalar(key, value, epoch)
+            else:
+                writer.add_figure(key, (v), epoch)
+        if (epoch % save_freq) == 0:
+            trainer.save_checkpoint(osp.join(log_dir, 'epoch_%05d.pth' % epoch))
+
+        eval_loss = eval_results.get('eval/loss')
+        if eval_loss is not None and eval_loss < best_eval_loss:
+            best_eval_loss = eval_loss
+            logger.info('New best model with eval/loss %.4f', best_eval_loss)
+            trainer.save_checkpoint(osp.join(log_dir, 'best.pth'), use_ema_model=True)
 
     return 0
 

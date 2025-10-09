@@ -12,6 +12,7 @@ training:
   mixed_precision: true
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
+  ema_decay: 0.999
 
 model_params:
   num_class: 1
