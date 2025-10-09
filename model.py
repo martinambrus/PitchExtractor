@@ -14,10 +14,21 @@ class JDCNet(nn.Module):
     """
     Joint Detection and Classification Network model for singing voice melody.
     """
-    def __init__(self, num_class=722, leaky_relu_slope=0.01, sequence_model_config=None):
+    def __init__(
+        self,
+        num_class=722,
+        leaky_relu_slope=0.01,
+        sequence_model_config=None,
+        head_dropout=0.2,
+    ):
         super().__init__()
         self.num_class = num_class
         sequence_model_config = sequence_model_config or {}
+        head_dropout = float(head_dropout)
+        # Constrain dropout probability to a sensible range for the heads.
+        head_dropout = max(0.1, min(0.3, head_dropout))
+        self.classifier_dropout = nn.Dropout(p=head_dropout)
+        self.detector_dropout = nn.Dropout(p=head_dropout)
 
         # input = (b, 1, 31, 513), b = batch size
         self.conv_block = nn.Sequential(
@@ -92,6 +103,7 @@ class JDCNet(nn.Module):
         # (b, 256, 31, 2) => (b, 31, 256, 2) => (b, 31, 512)
         classifier_out = poolblock_out.permute(0, 2, 1, 3).contiguous().view((-1, seq_len, 512))
         classifier_out = self.sequence_classifier(classifier_out)
+        classifier_out = self.classifier_dropout(classifier_out)
 
         classifier_out = classifier_out.contiguous().view((-1, classifier_out.shape[-1]))  # (b * 31, hidden)
         classifier_out = self.classifier(classifier_out)
@@ -111,6 +123,7 @@ class JDCNet(nn.Module):
         # (b, 256, 31, 2) => (b, 31, 256, 2) => (b, 31, 512)
         detector_out = detector_out.permute(0, 2, 1, 3).contiguous().view((-1, seq_len, 512))
         detector_out = self.sequence_detector(detector_out)  # (b, 31, hidden)
+        detector_out = self.detector_dropout(detector_out)
 
         detector_out = detector_out.contiguous().view((-1, detector_out.shape[-1]))
         detector_out = self.detector(detector_out)

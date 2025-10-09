@@ -86,6 +86,7 @@ def _train_single_run(config, config_path, run_log_dir):
     model = JDCNet(
         num_class=model_config.get('num_class', 1),  # num_class = 1 means regression
         sequence_model_config=sequence_model_config,
+        head_dropout=float(model_config.get('head_dropout', 0.2)),
     )
 
     scheduler_params = {
@@ -96,8 +97,9 @@ def _train_single_run(config, config_path, run_log_dir):
         }
 
     model.to(device)
+    optimizer_params = config.get('optimizer_params', {})
     optimizer, scheduler = build_optimizer(
-        {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
+        {"params": model.parameters(), "optimizer_params": optimizer_params, "scheduler_params": scheduler_params})
 
     loss_config = config.get('loss_params', {})
     f0_delta = float(loss_config.get('f0_huber_delta', 0.075))
