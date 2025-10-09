@@ -314,6 +314,37 @@ class Trainer(object):
         lambda_f0 = float(self.loss_config.get('lambda_f0', 1.0))
         return lambda_f0 * loss_f0
 
+    def _compute_voicing_loss(self, silence_logits, silence_labels):
+        """Compute the voiced/unvoiced BCE loss with optional re-weighting."""
+
+        if silence_logits.dim() > silence_labels.dim():
+            silence_logits = silence_logits.squeeze(-1)
+
+        base_loss = self.criterion['ce'](silence_logits, silence_labels)
+        if base_loss.dim() > silence_labels.dim():
+            base_loss = base_loss.squeeze(-1)
+
+        # ``silence_labels`` are 1.0 for unvoiced frames and 0.0 for voiced frames.
+        voiced_mask = (silence_labels < 0.5).to(base_loss.dtype)
+        voiced_fraction = voiced_mask.mean().item() if voiced_mask.numel() > 0 else 0.0
+
+        minority_threshold = float(self.loss_config.get('voicing_minority_threshold', 0.5))
+        voiced_weight = float(self.loss_config.get('voicing_pos_weight', 1.0))
+
+        if voiced_fraction < minority_threshold and voiced_weight > 1.0:
+            # Apply the configured weight to voiced frames while keeping
+            # unvoiced frames at unit weight.
+            voiced_scale = torch.full_like(base_loss, voiced_weight)
+            weight_tensor = torch.where(voiced_mask > 0.5,
+                                        voiced_scale,
+                                        torch.ones_like(base_loss))
+            normaliser = weight_tensor.sum().clamp_min(1.0)
+            weighted_loss = (base_loss * weight_tensor).sum() / normaliser
+            return weighted_loss
+
+        # Default to the unweighted mean for balanced batches.
+        return base_loss.mean()
+
     def run(self, batch):
         self.optimizer.zero_grad(set_to_none=True)
         batch = [b.to(self.device, non_blocking=True) for b in batch]
@@ -333,7 +364,7 @@ class Trainer(object):
                 f0_pred, sil_pred = self.model(x.transpose(-1, -2))
 
             loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
-            loss_sil = self.criterion['ce'](sil_pred, sil)
+            loss_sil = self._compute_voicing_loss(sil_pred, sil)
             loss = loss_f0 + loss_sil
 
         if self.use_amp:
@@ -380,7 +411,7 @@ class Trainer(object):
                 f0_pred, sil_pred = eval_model(x.transpose(-1, -2))
 
                 loss_f0 = self._compute_f0_loss(f0_pred, f0, sil)
-                loss_sil = self.criterion['ce'](sil_pred, sil)
+                loss_sil = self._compute_voicing_loss(sil_pred, sil)
                 loss = loss_f0 + loss_sil
 
 

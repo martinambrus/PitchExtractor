@@ -106,7 +106,9 @@ def main(config_path):
 
     criterion = {
         'f0': nn.SmoothL1Loss(reduction='none', beta=f0_delta),  # F0 loss (regression)
-        'ce': nn.BCEWithLogitsLoss()  # silence loss (binary classification)
+        # Keep the BCE loss in ``none`` mode so the trainer can apply
+        # per-frame weights based on the voiced/unvoiced distribution.
+        'ce': nn.BCEWithLogitsLoss(reduction='none')  # silence loss (binary classification)
     }
 
     trainer = Trainer(model=model,

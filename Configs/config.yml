@@ -34,6 +34,13 @@ loss_params:
   f0_huber_delta: 0.075
   f0_log_min_hz: 1.0
   f0_cents_reference_hz: 55.0
+  # When voiced frames are scarce the voiced/unvoiced (V/UV) head can
+  # underfit. Increase the weight on voiced examples when they form the
+  # minority of a batch. Start around 2.0 and consider sweeping the
+  # candidates listed below.
+  voicing_pos_weight: 2.0
+  voicing_pos_weight_candidates: [1.5, 2.0, 3.0]
+  voicing_minority_threshold: 0.5
 
 dataset_params:
   mel_params:
