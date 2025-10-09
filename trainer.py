@@ -6,6 +6,7 @@ import sys
 import time
 from collections import defaultdict
 import inspect
+import copy
 
 import numpy as np
 import torch
@@ -45,7 +46,8 @@ class Trainer(object):
                  initial_epochs=0,
                  use_mixed_precision=False,
                  gradient_checkpointing=False,
-                 checkpoint_use_reentrant=None):
+                 checkpoint_use_reentrant=None,
+                 ema_decay=0.0):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -135,10 +137,21 @@ class Trainer(object):
                 )
                 self._checkpoint_kwargs["use_reentrant"] = self.gradient_checkpoint_use_reentrant
 
-    def save_checkpoint(self, checkpoint_path):
+        self.ema_decay = float(ema_decay) if ema_decay is not None else 0.0
+        self.ema_model = None
+        if self.ema_decay > 0.0:
+            self.ema_model = copy.deepcopy(self.model)
+            self.ema_model.to(self.device)
+            for param in self.ema_model.parameters():
+                param.requires_grad_(False)
+            self.logger.info("Model EMA enabled with decay %.6f", self.ema_decay)
+
+    def save_checkpoint(self, checkpoint_path, use_ema_model=False):
         """Save checkpoint.
         Args:
             checkpoint_path (str): Checkpoint path to be saved.
+            use_ema_model (bool): Whether to save EMA weights as the primary
+                model state.
         """
         state_dict = {
             "optimizer": self.optimizer.state_dict(),
@@ -146,20 +159,55 @@ class Trainer(object):
             "steps": self.steps,
             "epochs": self.epochs,
         }
-        state_dict["model"] = self.model.state_dict()
+        model_state = self.model.state_dict()
+        if self.ema_model is not None:
+            ema_state = self.ema_model.state_dict()
+            state_dict["ema_model"] = ema_state
+            state_dict["ema_decay"] = self.ema_decay
+            if use_ema_model:
+                state_dict["model_non_ema"] = model_state
+                model_state = ema_state
+        state_dict["model"] = model_state
 
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
         torch.save(state_dict, checkpoint_path)
 
-    def load_checkpoint(self, checkpoint_path, load_only_params=False):
+    def load_checkpoint(self, checkpoint_path, load_only_params=False, load_ema_as_model=False):
         """Load checkpoint.
         Args:
             checkpoint_path (str): Checkpoint path to be loaded.
             load_only_params (bool): Whether to load only model parameters.
+            load_ema_as_model (bool): Load EMA parameters instead of raw
+                weights when available.
         """
         state_dict = torch.load(checkpoint_path, map_location="cpu")
-        self._load(state_dict["model"], self.model)
+        if load_ema_as_model and "ema_model" in state_dict:
+            model_key = "ema_model"
+        elif not load_ema_as_model and "model_non_ema" in state_dict:
+            model_key = "model_non_ema"
+        else:
+            model_key = "model"
+        self._load(state_dict[model_key], self.model)
+
+        self.ema_decay = state_dict.get("ema_decay", self.ema_decay)
+        ema_state = state_dict.get("ema_model")
+        if self.ema_decay > 0.0:
+            if self.ema_model is None:
+                self.ema_model = copy.deepcopy(self.model)
+                self.ema_model.to(self.device)
+                for param in self.ema_model.parameters():
+                    param.requires_grad_(False)
+            if ema_state is not None:
+                self._load(ema_state, self.ema_model)
+            else:
+                # Synchronize EMA weights with the loaded model when no EMA
+                # snapshot is available in the checkpoint.
+                self.ema_model.load_state_dict(self.model.state_dict())
+                self.logger.info(
+                    "EMA state missing from checkpoint; initialized EMA weights "
+                    "from current model parameters."
+                )
 
         if not load_only_params:
             self.steps = state_dict["steps"]
@@ -216,6 +264,21 @@ class Trainer(object):
             break
         return lr
 
+    def _update_ema(self):
+        if self.ema_model is None:
+            return
+
+        with torch.no_grad():
+            ema_params = list(self.ema_model.parameters())
+            model_params = list(self.model.parameters())
+            for ema_param, model_param in zip(ema_params, model_params):
+                ema_param.mul_(self.ema_decay).add_(model_param.detach(), alpha=1.0 - self.ema_decay)
+
+            ema_buffers = list(self.ema_model.buffers())
+            model_buffers = list(self.model.buffers())
+            for ema_buffer, model_buffer in zip(ema_buffers, model_buffers):
+                ema_buffer.copy_(model_buffer)
+
     def run(self, batch):
         self.optimizer.zero_grad(set_to_none=True)
         batch = [b.to(self.device, non_blocking=True) for b in batch]
@@ -245,6 +308,7 @@ class Trainer(object):
         else:
             loss.backward()
             self.optimizer.step()
+        self._update_ema()
         self.scheduler.step()
 
         return {'loss': loss.item(),
@@ -266,7 +330,10 @@ class Trainer(object):
 
     @torch.no_grad()
     def _eval_epoch(self):
-        self.model.eval()
+        eval_model = self.ema_model if self.ema_model is not None else self.model
+        base_model_training = self.model.training
+        eval_model_training = eval_model.training
+        eval_model.eval()
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
@@ -275,7 +342,7 @@ class Trainer(object):
 
             autocast_context = self._autocast_cm
             with autocast_context():
-                f0_pred, sil_pred = self.model(x.transpose(-1, -2))
+                f0_pred, sil_pred = eval_model(x.transpose(-1, -2))
 
                 loss_f0 = self.loss_config['lambda_f0'] * self.criterion['l1'](f0_pred.squeeze(), f0)
                 loss_sil = self.criterion['ce'](sil_pred, sil)
@@ -285,7 +352,9 @@ class Trainer(object):
             eval_losses["eval/loss"].append(loss.item())
             eval_losses["eval/f0"].append(loss_f0.item())
             eval_losses["eval/sil"].append(loss_sil.item())
-            
+
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)
+        eval_model.train(eval_model_training)
+        self.model.train(base_model_training)
         return eval_losses
