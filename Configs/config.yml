@@ -13,6 +13,7 @@ training:
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
   ema_decay: 0.9997
+  scheduler_metric: eval/vuv_f1
 
 model_params:
   num_class: 1
@@ -28,7 +29,8 @@ model_params:
 optimizer_params:
   lr: 0.0003
   weight_decay: 0.0003
-  
+  scheduler_type: one_cycle
+
 loss_params:
   lambda_f0: 0.1
   lambda_vuv: 0.5
@@ -38,6 +40,10 @@ loss_params:
   f0_huber_delta: 0.075
   f0_log_min_hz: 1.0
   f0_cents_reference_hz: 55.0
+  silence_label_smoothing: 0.0
+  silence_use_focal_loss: false
+  silence_focal_gamma: 2.0
+  silence_focal_alpha: null
 
 dataset_params:
   mel_params:

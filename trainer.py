@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from PIL import Image
 from tqdm import tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import matplotlib.pyplot as plt
 
@@ -47,7 +48,8 @@ class Trainer(object):
                  use_mixed_precision=False,
                  gradient_checkpointing=False,
                  checkpoint_use_reentrant=None,
-                 ema_decay=0.0):
+                 ema_decay=0.0,
+                 scheduler_metric='eval/vuv_f1'):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -161,6 +163,8 @@ class Trainer(object):
             for param in self.ema_model.parameters():
                 param.requires_grad_(False)
             self.logger.info("Model EMA enabled with decay %.6f", self.ema_decay)
+        self.scheduler_metric = scheduler_metric
+        self.scheduler_requires_metric = isinstance(self.scheduler, ReduceLROnPlateau)
 
     def save_checkpoint(self, checkpoint_path, use_ema_model=False):
         """Save checkpoint.
@@ -171,10 +175,13 @@ class Trainer(object):
         """
         state_dict = {
             "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
             "steps": self.steps,
             "epochs": self.epochs,
         }
+        if self.scheduler is not None:
+            state_dict["scheduler"] = self.scheduler.state_dict()
+        else:
+            state_dict["scheduler"] = None
         model_state = self.model.state_dict()
         if self.ema_model is not None:
             ema_state = self.ema_model.state_dict()
@@ -230,9 +237,24 @@ class Trainer(object):
             self.epochs = state_dict["epochs"]
             self.optimizer.load_state_dict(state_dict["optimizer"])
 
-            # overwrite schedular argument parameters
-            state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
-            self.scheduler.load_state_dict(state_dict["scheduler"])
+            scheduler_state = state_dict.get("scheduler")
+            if self.scheduler is not None and scheduler_state is not None:
+                scheduler_state = copy.deepcopy(scheduler_state)
+                scheduler_state.update(**self.config.get("scheduler_params", {}))
+                self.scheduler.load_state_dict(scheduler_state)
+            elif self.scheduler is not None and scheduler_state is None:
+                if self.logger is not None:
+                    try:
+                        self.logger.warning("Scheduler state missing from checkpoint; keeping current scheduler settings.")
+                    except Exception:
+                        pass
+            elif self.scheduler is None and scheduler_state is not None:
+                if self.logger is not None:
+                    try:
+                        self.logger.warning("Checkpoint contains a scheduler state but no scheduler is configured; ignoring it.")
+                    except Exception:
+                        pass
+            self.scheduler_requires_metric = isinstance(self.scheduler, ReduceLROnPlateau)
 
     def _load(self, states, model, force_load=True):
         model_states = model.state_dict()
@@ -466,7 +488,8 @@ class Trainer(object):
             loss.backward()
             self.optimizer.step()
         self._update_ema()
-        self.scheduler.step()
+        if self.scheduler is not None and not self.scheduler_requires_metric:
+            self.scheduler.step()
 
         return {'loss': loss.item(),
                 'f0': loss_f0.item(),
@@ -575,3 +598,26 @@ class Trainer(object):
         eval_model.train(eval_model_training)
         self.model.train(base_model_training)
         return eval_losses
+
+    def update_scheduler(self, metrics=None):
+        if self.scheduler is None or not self.scheduler_requires_metric:
+            return
+
+        metric_value = None
+        if isinstance(metrics, dict):
+            metric_value = metrics.get(self.scheduler_metric)
+            if metric_value is None and self.scheduler_metric != 'eval/loss':
+                metric_value = metrics.get('eval/loss')
+
+        if metric_value is None:
+            if self.logger is not None:
+                try:
+                    self.logger.warning(
+                        "Unable to find metric '%s' for scheduler update; skipping step.",
+                        self.scheduler_metric,
+                    )
+                except Exception:
+                    pass
+            return
+
+        self.scheduler.step(metric_value)
