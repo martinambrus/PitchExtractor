@@ -231,6 +231,7 @@ def _train_single_run(config, config_path, run_log_dir):
                     logger.info('New best model with eval/vuv_f1 %.4f', best_eval_f1)
             else:
                 logger.info('New best model with eval/loss %.4f', best_eval_loss)
+            trainer.save_checkpoint(osp.join(run_log_dir, 'epoch_%05d.pth' % epoch))
             trainer.save_checkpoint(osp.join(run_log_dir, 'best.pth'), use_ema_model=True)
 
         if trainer.finish_train:
