@@ -34,6 +34,10 @@ loss_params:
   lambda_vuv: 0.5
   lambda_vuv_candidates:
     - 0.25
+  vuv_initial_threshold: 0.5
+  vuv_calibration_steps: 201
+  vuv_threshold_update_cadence: 2
+  vuv_threshold_ema_decay: 0.6
   f0_loss_scale: log_hz
   f0_huber_delta: 0.075
   f0_log_min_hz: 1.0

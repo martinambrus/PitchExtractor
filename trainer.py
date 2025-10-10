@@ -63,6 +63,16 @@ class Trainer(object):
         self.lambda_vuv = float(self.loss_config.get("lambda_vuv", 1.0))
         self.vuv_threshold = float(self.loss_config.get("vuv_initial_threshold", 0.5))
         self.vuv_calibration_steps = int(self.loss_config.get("vuv_calibration_steps", 201))
+        self.vuv_threshold_ema_decay = float(self.loss_config.get("vuv_threshold_ema_decay", 0.0))
+        if self.vuv_threshold_ema_decay < 0.0:
+            self.vuv_threshold_ema_decay = 0.0
+        if self.vuv_threshold_ema_decay > 0.999999:
+            self.vuv_threshold_ema_decay = 0.999999
+        self.vuv_threshold_update_cadence = int(self.loss_config.get("vuv_threshold_update_cadence", 1))
+        if self.vuv_threshold_update_cadence < 1:
+            self.vuv_threshold_update_cadence = 1
+        self._pending_vuv_thresholds = []
+        self._vuv_calibration_since_update = 0
         if self.vuv_calibration_steps < 2:
             self.vuv_calibration_steps = 2
         if self.logger is not None:
@@ -73,6 +83,16 @@ class Trainer(object):
                     self.vuv_threshold,
                     self.vuv_calibration_steps,
                 )
+                if self.vuv_threshold_update_cadence > 1:
+                    self.logger.info(
+                        "V/UV threshold updates will be applied every %d evaluations",
+                        self.vuv_threshold_update_cadence,
+                    )
+                if self.vuv_threshold_ema_decay > 0.0:
+                    self.logger.info(
+                        "Applying EMA smoothing with decay %.6f to V/UV threshold updates",
+                        self.vuv_threshold_ema_decay,
+                    )
             except Exception:
                 # Logger may not be fully initialised in some unit tests; fail silently.
                 pass
@@ -394,20 +414,20 @@ class Trainer(object):
         }
 
         if not voiced_prob_batches or not silence_label_batches:
-            return None, default_metrics
+            return None, default_metrics, None, None
 
         voiced_probs = torch.cat([batch.reshape(-1) for batch in voiced_prob_batches], dim=0).to(torch.float32)
         silence_labels = torch.cat([batch.reshape(-1) for batch in silence_label_batches], dim=0).to(torch.float32)
 
         if voiced_probs.numel() == 0:
-            return None, default_metrics
+            return None, default_metrics, None, None
 
         voiced_probs_np = voiced_probs.numpy()
         voiced_targets_np = (1.0 - silence_labels.numpy())
 
         positive_mask = voiced_targets_np >= 0.5
         if positive_mask.size == 0:
-            return float(self.vuv_threshold), default_metrics.copy()
+            return float(self.vuv_threshold), default_metrics.copy(), voiced_probs_np, positive_mask
 
         thresholds = np.linspace(0.0, 1.0, num=self.vuv_calibration_steps)
         thresholds = np.unique(np.concatenate([thresholds, [self.vuv_threshold]]))
@@ -427,7 +447,7 @@ class Trainer(object):
                 best_metrics = metrics
                 best_f1 = f1_score
 
-        return best_threshold, best_metrics
+        return best_threshold, best_metrics, voiced_probs_np, positive_mask
 
     def run(self, batch):
         self.optimizer.zero_grad(set_to_none=True)
@@ -523,21 +543,60 @@ class Trainer(object):
 
         mean_silence_weighted = float(self.lambda_vuv * mean_silence)
 
-        metrics = {}
+        candidate_metrics = None
+        voiced_probs_np = None
+        positive_mask = None
+        latest_candidate_threshold = None
         if voicing_prob_batches:
-            new_threshold, metrics = self._calibrate_vuv_threshold(voicing_prob_batches, silence_label_batches)
-            if new_threshold is not None and not np.isclose(new_threshold, self.vuv_threshold):
-                previous_threshold = self.vuv_threshold
-                self.vuv_threshold = float(new_threshold)
-                if self.logger is not None:
-                    try:
-                        self.logger.info(
-                            "Updated V/UV threshold from %.4f to %.4f after calibration",
-                            previous_threshold,
-                            self.vuv_threshold,
-                        )
-                    except Exception:
-                        pass
+            new_threshold, candidate_metrics, voiced_probs_np, positive_mask = self._calibrate_vuv_threshold(
+                voicing_prob_batches,
+                silence_label_batches,
+            )
+            if new_threshold is not None:
+                latest_candidate_threshold = float(np.clip(new_threshold, 0.0, 1.0))
+                self._pending_vuv_thresholds.append(latest_candidate_threshold)
+                max_buffer = max(1, self.vuv_threshold_update_cadence)
+                if len(self._pending_vuv_thresholds) > max_buffer:
+                    self._pending_vuv_thresholds = self._pending_vuv_thresholds[-max_buffer:]
+        else:
+            candidate_metrics = {
+                "eval/vuv_f1": 0.0,
+                "eval/vuv_precision": 0.0,
+                "eval/vuv_recall": 0.0,
+                "eval/vuv_accuracy": 0.0,
+            }
+
+        self._vuv_calibration_since_update += 1
+        apply_update = self._vuv_calibration_since_update >= self.vuv_threshold_update_cadence
+        if apply_update:
+            if self._pending_vuv_thresholds:
+                candidate_threshold = float(np.mean(self._pending_vuv_thresholds))
+                candidate_threshold = float(np.clip(candidate_threshold, 0.0, 1.0))
+                decay = self.vuv_threshold_ema_decay
+                if decay > 0.0:
+                    candidate_threshold = float(
+                        decay * self.vuv_threshold + (1.0 - decay) * candidate_threshold
+                    )
+                    candidate_threshold = float(np.clip(candidate_threshold, 0.0, 1.0))
+                if not np.isclose(candidate_threshold, self.vuv_threshold):
+                    previous_threshold = self.vuv_threshold
+                    self.vuv_threshold = float(candidate_threshold)
+                    if self.logger is not None:
+                        try:
+                            self.logger.info(
+                                "Updated V/UV threshold from %.4f to %.4f after calibration",
+                                previous_threshold,
+                                self.vuv_threshold,
+                            )
+                        except Exception:
+                            pass
+            self._pending_vuv_thresholds.clear()
+            self._vuv_calibration_since_update = 0
+
+        if voiced_probs_np is not None and positive_mask is not None:
+            metrics = self._compute_vuv_metrics_from_arrays(voiced_probs_np, positive_mask, self.vuv_threshold)
+        elif candidate_metrics is not None:
+            metrics = candidate_metrics
         else:
             metrics = {
                 "eval/vuv_f1": 0.0,
@@ -547,6 +606,8 @@ class Trainer(object):
             }
 
         metrics["eval/vuv_threshold"] = float(self.vuv_threshold)
+        if latest_candidate_threshold is not None:
+            metrics["eval/vuv_threshold_candidate"] = float(latest_candidate_threshold)
 
         f0_losses = []
         for (f0_pred_cpu, f0_target_cpu), probs_cpu, sil_cpu in zip(f0_batches, voicing_prob_batches, silence_label_batches):
