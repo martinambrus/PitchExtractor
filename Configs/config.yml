@@ -14,6 +14,11 @@ training:
   gradient_checkpointing_use_reentrant: false
   ema_decay: 0.9997
   scheduler_metric: eval/vuv_f1
+  early_stop:
+    enabled: true
+    min_lr: 0.000003
+    patience: 9
+    metric: eval/vuv_f1
 
 model_params:
   num_class: 1

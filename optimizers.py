@@ -81,6 +81,9 @@ def _define_scheduler(optimizer, params):
         )
 
     if scheduler_type in {'reduce_on_plateau', 'plateau'}:
+        min_lr = float(params.get('min_lr', 1e-6))
+        if min_lr < 0.0:
+            min_lr = 0.0
         return ReduceLROnPlateau(
             optimizer,
             mode=params.get('mode', 'max'),
@@ -89,7 +92,7 @@ def _define_scheduler(optimizer, params):
             threshold=params.get('threshold', 1e-4),
             threshold_mode=params.get('threshold_mode', 'rel'),
             cooldown=params.get('cooldown', 0),
-            min_lr=params.get('min_lr', 0.0),
+            min_lr=min_lr,
             eps=params.get('eps', 1e-8),
         )
 
