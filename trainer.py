@@ -68,6 +68,17 @@ class Trainer(object):
         self.vuv_calibration_steps = int(self.loss_config.get("vuv_calibration_steps", 201))
         if self.vuv_calibration_steps < 2:
             self.vuv_calibration_steps = 2
+        # Parameters controlling voiced/unvoiced threshold stabilisation.
+        self.vuv_threshold_smoothing = float(self.loss_config.get("vuv_threshold_smoothing", 0.8))
+        self.vuv_threshold_freeze_tolerance = float(
+            self.loss_config.get("vuv_threshold_freeze_tolerance", 0.005)
+        )
+        self.vuv_threshold_freeze_patience = int(
+            self.loss_config.get("vuv_threshold_freeze_patience", 5)
+        )
+        self._vuv_threshold_stable_epochs = 0
+        self._vuv_threshold_frozen = False
+        self._frozen_vuv_threshold = None
         if self.logger is not None:
             try:
                 self.logger.info("Using lambda_vuv=%.4f for voiced/unvoiced loss", self.lambda_vuv)
@@ -178,6 +189,12 @@ class Trainer(object):
             "optimizer": self.optimizer.state_dict(),
             "steps": self.steps,
             "epochs": self.epochs,
+            "vuv_threshold": float(self.vuv_threshold),
+            "vuv_threshold_stable_epochs": int(self._vuv_threshold_stable_epochs),
+            "vuv_threshold_frozen": bool(self._vuv_threshold_frozen),
+            "vuv_threshold_frozen_value": float(self._frozen_vuv_threshold)
+            if self._frozen_vuv_threshold is not None
+            else None,
         }
         if self.scheduler is not None:
             state_dict["scheduler"] = self.scheduler.state_dict()
@@ -232,6 +249,20 @@ class Trainer(object):
                     "EMA state missing from checkpoint; initialized EMA weights "
                     "from current model parameters."
                 )
+
+        self.vuv_threshold = float(state_dict.get("vuv_threshold", self.vuv_threshold))
+        self._vuv_threshold_stable_epochs = int(
+            state_dict.get("vuv_threshold_stable_epochs", self._vuv_threshold_stable_epochs)
+        )
+        self._vuv_threshold_frozen = bool(
+            state_dict.get("vuv_threshold_frozen", self._vuv_threshold_frozen)
+        )
+        frozen_value = state_dict.get("vuv_threshold_frozen_value", self._frozen_vuv_threshold)
+        self._frozen_vuv_threshold = (
+            float(frozen_value) if frozen_value is not None else None
+        )
+        if self._vuv_threshold_frozen and self._frozen_vuv_threshold is not None:
+            self.vuv_threshold = float(self._frozen_vuv_threshold)
 
         if not load_only_params:
             self.steps = state_dict["steps"]
@@ -497,20 +528,20 @@ class Trainer(object):
         }
 
         if not voiced_prob_batches or not silence_label_batches:
-            return None, default_metrics
+            return None, default_metrics, None, None
 
         voiced_probs = torch.cat([batch.reshape(-1) for batch in voiced_prob_batches], dim=0).to(torch.float32)
         silence_labels = torch.cat([batch.reshape(-1) for batch in silence_label_batches], dim=0).to(torch.float32)
 
         if voiced_probs.numel() == 0:
-            return None, default_metrics
+            return None, default_metrics, None, None
 
         voiced_probs_np = voiced_probs.numpy()
         voiced_targets_np = (1.0 - silence_labels.numpy())
 
         positive_mask = voiced_targets_np >= 0.5
         if positive_mask.size == 0:
-            return float(self.vuv_threshold), default_metrics.copy()
+            return float(self.vuv_threshold), default_metrics.copy(), voiced_probs_np, positive_mask
 
         thresholds = np.linspace(0.0, 1.0, num=self.vuv_calibration_steps)
         thresholds = np.unique(np.concatenate([thresholds, [self.vuv_threshold]]))
@@ -530,7 +561,7 @@ class Trainer(object):
                 best_metrics = metrics
                 best_f1 = f1_score
 
-        return best_threshold, best_metrics
+        return best_threshold, best_metrics, voiced_probs_np, positive_mask
 
     def run(self, batch):
         self.optimizer.zero_grad(set_to_none=True)
@@ -629,19 +660,66 @@ class Trainer(object):
 
         metrics = {}
         if voicing_prob_batches:
-            new_threshold, metrics = self._calibrate_vuv_threshold(voicing_prob_batches, silence_label_batches)
-            if new_threshold is not None and not np.isclose(new_threshold, self.vuv_threshold):
-                previous_threshold = self.vuv_threshold
-                self.vuv_threshold = float(new_threshold)
-                if self.logger is not None:
-                    try:
-                        self.logger.info(
-                            "Updated V/UV threshold from %.4f to %.4f after calibration",
-                            previous_threshold,
-                            self.vuv_threshold,
-                        )
-                    except Exception:
-                        pass
+            (
+                calibrated_threshold,
+                _calibration_metrics,
+                voiced_probs_np,
+                positive_mask,
+            ) = self._calibrate_vuv_threshold(voicing_prob_batches, silence_label_batches)
+
+            if (
+                voiced_probs_np is not None
+                and positive_mask is not None
+                and positive_mask.size > 0
+            ):
+                if not self._vuv_threshold_frozen and calibrated_threshold is not None:
+                    smoothing = float(self.vuv_threshold_smoothing)
+                    smoothing = min(max(smoothing, 0.0), 1.0)
+                    smoothed_threshold = (
+                        smoothing * float(self.vuv_threshold)
+                        + (1.0 - smoothing) * float(calibrated_threshold)
+                    )
+                    smoothed_threshold = float(np.clip(smoothed_threshold, 0.0, 1.0))
+                    delta = abs(smoothed_threshold - float(self.vuv_threshold))
+                    if delta > 0.0:
+                        previous_threshold = float(self.vuv_threshold)
+                        self.vuv_threshold = smoothed_threshold
+                        if self.logger is not None:
+                            try:
+                                self.logger.info(
+                                    "Smoothed V/UV threshold from %.4f to %.4f (calibrated %.4f)",
+                                    previous_threshold,
+                                    self.vuv_threshold,
+                                    float(calibrated_threshold),
+                                )
+                            except Exception:
+                                pass
+
+                    if delta < self.vuv_threshold_freeze_tolerance:
+                        self._vuv_threshold_stable_epochs += 1
+                        if self._vuv_threshold_stable_epochs >= self.vuv_threshold_freeze_patience:
+                            self._vuv_threshold_frozen = True
+                            self._frozen_vuv_threshold = float(self.vuv_threshold)
+                            self._vuv_threshold_stable_epochs = self.vuv_threshold_freeze_patience
+                            if self.logger is not None:
+                                try:
+                                    self.logger.info(
+                                        "Frozen V/UV threshold at %.4f after %d stable epochs",
+                                        self.vuv_threshold,
+                                        self.vuv_threshold_freeze_patience,
+                                    )
+                                except Exception:
+                                    pass
+                    else:
+                        self._vuv_threshold_stable_epochs = 0
+
+                metrics = self._compute_vuv_metrics_from_arrays(
+                    voiced_probs_np,
+                    positive_mask,
+                    float(self.vuv_threshold),
+                )
+            else:
+                metrics = _calibration_metrics
         else:
             metrics = {
                 "eval/vuv_f1": 0.0,
@@ -651,6 +729,8 @@ class Trainer(object):
             }
 
         metrics["eval/vuv_threshold"] = float(self.vuv_threshold)
+        metrics["eval/vuv_threshold_frozen"] = 1.0 if self._vuv_threshold_frozen else 0.0
+        metrics["eval/vuv_threshold_stable_epochs"] = float(self._vuv_threshold_stable_epochs)
 
         f0_losses = []
         for (f0_pred_cpu, f0_target_cpu), probs_cpu, sil_cpu in zip(f0_batches, voicing_prob_batches, silence_label_batches):
