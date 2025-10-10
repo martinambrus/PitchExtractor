@@ -7,6 +7,7 @@ from torch import nn
 from torch.optim import Optimizer
 from functools import reduce
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 
 class MultiOptimizer:
     def __init__(self, optimizers={}, schedulers={}):
@@ -64,16 +65,38 @@ def _define_optimizer(params):
     return optimizer, scheduler
 
 def _define_scheduler(optimizer, params):
-    print(params)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=params.get('max_lr', 5e-4),
-        epochs=params.get('epochs', 200),
-        steps_per_epoch=params.get('steps_per_epoch', 1000),
-        pct_start=params.get('pct_start', 0.0),
-        final_div_factor=5)
+    scheduler_type = str(params.get('type', 'one_cycle')).lower()
 
-    return scheduler
+    if scheduler_type in {'none', 'off', 'disable', 'disabled'}:
+        return None
+
+    if scheduler_type in {'one_cycle', 'onecycle', 'onecyclelr'}:
+        return OneCycleLR(
+            optimizer,
+            max_lr=params.get('max_lr', 5e-4),
+            epochs=params.get('epochs', 200),
+            steps_per_epoch=params.get('steps_per_epoch', 1000),
+            pct_start=params.get('pct_start', 0.0),
+            final_div_factor=params.get('final_div_factor', 5),
+        )
+
+    if scheduler_type in {'reduce_on_plateau', 'plateau'}:
+        min_lr = float(params.get('min_lr', 1e-6))
+        if min_lr < 0.0:
+            min_lr = 0.0
+        return ReduceLROnPlateau(
+            optimizer,
+            mode=params.get('mode', 'max'),
+            factor=params.get('factor', 0.5),
+            patience=params.get('patience', 5),
+            threshold=params.get('threshold', 1e-4),
+            threshold_mode=params.get('threshold_mode', 'rel'),
+            cooldown=params.get('cooldown', 0),
+            min_lr=min_lr,
+            eps=params.get('eps', 1e-8),
+        )
+
+    raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
 
 def build_multi_optimizer(parameters_dict, scheduler_params):
     optim = dict([(key, AdamW(params, lr=1e-4, weight_decay=1e-6, betas=(0.9, 0.98), eps=1e-9))

@@ -7,12 +7,14 @@ import time
 from collections import defaultdict
 import inspect
 import copy
+import math
 
 import numpy as np
 import torch
 from torch import nn
 from PIL import Image
 from tqdm import tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import matplotlib.pyplot as plt
 
@@ -47,7 +49,8 @@ class Trainer(object):
                  use_mixed_precision=False,
                  gradient_checkpointing=False,
                  checkpoint_use_reentrant=None,
-                 ema_decay=0.0):
+                 ema_decay=0.0,
+                 scheduler_metric='eval/vuv_f1'):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -57,7 +60,7 @@ class Trainer(object):
         self.scheduler = scheduler
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
-        self.config = config
+        self.config = config or {}
         self.logger = logger
         self.loss_config = loss_config or {}
         self.lambda_vuv = float(self.loss_config.get("lambda_vuv", 1.0))
@@ -161,6 +164,8 @@ class Trainer(object):
             for param in self.ema_model.parameters():
                 param.requires_grad_(False)
             self.logger.info("Model EMA enabled with decay %.6f", self.ema_decay)
+        self.scheduler_metric = scheduler_metric
+        self._configure_scheduler_helpers(reset_history=True)
 
     def save_checkpoint(self, checkpoint_path, use_ema_model=False):
         """Save checkpoint.
@@ -171,10 +176,13 @@ class Trainer(object):
         """
         state_dict = {
             "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
             "steps": self.steps,
             "epochs": self.epochs,
         }
+        if self.scheduler is not None:
+            state_dict["scheduler"] = self.scheduler.state_dict()
+        else:
+            state_dict["scheduler"] = None
         model_state = self.model.state_dict()
         if self.ema_model is not None:
             ema_state = self.ema_model.state_dict()
@@ -230,9 +238,57 @@ class Trainer(object):
             self.epochs = state_dict["epochs"]
             self.optimizer.load_state_dict(state_dict["optimizer"])
 
-            # overwrite schedular argument parameters
-            state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
-            self.scheduler.load_state_dict(state_dict["scheduler"])
+            scheduler_state = state_dict.get("scheduler")
+            if self.scheduler is not None and scheduler_state is not None:
+                scheduler_state = copy.deepcopy(scheduler_state)
+                scheduler_state.update(**self.config.get("scheduler_params", {}))
+                self.scheduler.load_state_dict(scheduler_state)
+            elif self.scheduler is not None and scheduler_state is None:
+                if self.logger is not None:
+                    try:
+                        self.logger.warning("Scheduler state missing from checkpoint; keeping current scheduler settings.")
+                    except Exception:
+                        pass
+            elif self.scheduler is None and scheduler_state is not None:
+                if self.logger is not None:
+                    try:
+                        self.logger.warning("Checkpoint contains a scheduler state but no scheduler is configured; ignoring it.")
+                    except Exception:
+                        pass
+            self._configure_scheduler_helpers(reset_history=True)
+
+    def _configure_scheduler_helpers(self, reset_history=True):
+        self.scheduler_requires_metric = isinstance(self.scheduler, ReduceLROnPlateau)
+
+        scheduler_mode = getattr(self.scheduler, "mode", None)
+        if scheduler_mode is None:
+            scheduler_mode = "max"
+        self._scheduler_mode = str(scheduler_mode).lower()
+
+        scheduler_eps = float(getattr(self.scheduler, "eps", 1e-8)) if self.scheduler is not None else 1e-8
+        if not math.isfinite(scheduler_eps) or scheduler_eps <= 0.0:
+            scheduler_eps = 1e-8
+
+        early_stop_config = (self.config or {}).get("early_stop", {})
+        default_enabled = self.scheduler_requires_metric
+        self.early_stop_enabled = bool(early_stop_config.get("enabled", default_enabled))
+        self.early_stop_min_lr = float(early_stop_config.get("min_lr", 3e-6))
+        if self.early_stop_min_lr < 0.0:
+            self.early_stop_min_lr = 0.0
+        self.early_stop_patience = max(1, int(early_stop_config.get("patience", 9)))
+        self.early_stop_metric = str(early_stop_config.get("metric", self.scheduler_metric))
+        self.early_stop_mode = str(early_stop_config.get("mode", self._scheduler_mode)).lower()
+
+        configured_delta = early_stop_config.get("min_delta")
+        if configured_delta is None:
+            min_delta = scheduler_eps if self.early_stop_mode == self._scheduler_mode else max(1e-6, scheduler_eps)
+        else:
+            min_delta = max(0.0, float(configured_delta))
+        self.early_stop_min_delta = min_delta
+
+        if reset_history or not hasattr(self, "_best_early_stop_metric"):
+            self._best_early_stop_metric = None
+            self._epochs_since_early_stop_improve = 0
 
     def _load(self, states, model, force_load=True):
         model_states = model.state_dict()
@@ -279,6 +335,53 @@ class Trainer(object):
             lr = param_group['lr']
             break
         return lr
+
+    def _update_early_stopping(self, metric_value):
+        if not self.early_stop_enabled or not self.scheduler_requires_metric:
+            return
+
+        if metric_value is None:
+            return
+
+        try:
+            metric_value = float(metric_value)
+        except (TypeError, ValueError):
+            return
+
+        if not math.isfinite(metric_value):
+            return
+
+        if self._best_early_stop_metric is None:
+            self._best_early_stop_metric = metric_value
+            self._epochs_since_early_stop_improve = 0
+            return
+
+        if self.early_stop_mode == 'max':
+            improved = metric_value > self._best_early_stop_metric + self.early_stop_min_delta
+        else:
+            improved = metric_value < self._best_early_stop_metric - self.early_stop_min_delta
+
+        if improved:
+            self._best_early_stop_metric = metric_value
+            self._epochs_since_early_stop_improve = 0
+            return
+
+        self._epochs_since_early_stop_improve += 1
+
+        current_lr = self._get_lr()
+        if current_lr <= self.early_stop_min_lr and self._epochs_since_early_stop_improve >= self.early_stop_patience:
+            if not self.finish_train and self.logger is not None:
+                try:
+                    self.logger.info(
+                        "Early stopping triggered after %d stagnant epochs at learning rate %.6e (threshold %.6e) based on metric '%s'.",
+                        self._epochs_since_early_stop_improve,
+                        current_lr,
+                        self.early_stop_min_lr,
+                        self.early_stop_metric,
+                    )
+                except Exception:
+                    pass
+            self.finish_train = True
 
     def _update_ema(self):
         if self.ema_model is None:
@@ -466,7 +569,8 @@ class Trainer(object):
             loss.backward()
             self.optimizer.step()
         self._update_ema()
-        self.scheduler.step()
+        if self.scheduler is not None and not self.scheduler_requires_metric:
+            self.scheduler.step()
 
         return {'loss': loss.item(),
                 'f0': loss_f0.item(),
@@ -575,3 +679,41 @@ class Trainer(object):
         eval_model.train(eval_model_training)
         self.model.train(base_model_training)
         return eval_losses
+
+    def update_scheduler(self, metrics=None):
+        if self.scheduler is None:
+            self._update_early_stopping(None)
+            return
+
+        metric_value = None
+        if self.scheduler_requires_metric:
+            if isinstance(metrics, dict):
+                metric_value = metrics.get(self.scheduler_metric)
+                if metric_value is None and self.scheduler_metric != 'eval/loss':
+                    metric_value = metrics.get('eval/loss')
+
+            if metric_value is None:
+                if self.logger is not None:
+                    try:
+                        self.logger.warning(
+                            "Unable to find metric '%s' for scheduler update; skipping step.",
+                            self.scheduler_metric,
+                        )
+                    except Exception:
+                        pass
+                self._update_early_stopping(None)
+                return
+
+            self.scheduler.step(metric_value)
+
+        early_stop_value = None
+        if isinstance(metrics, dict):
+            early_stop_value = metrics.get(self.early_stop_metric)
+            if early_stop_value is None and self.early_stop_metric == 'eval/loss':
+                early_stop_value = metrics.get('eval/loss')
+            if early_stop_value is None and self.early_stop_metric == self.scheduler_metric:
+                early_stop_value = metric_value
+        elif self.early_stop_metric == self.scheduler_metric:
+            early_stop_value = metric_value
+
+        self._update_early_stopping(early_stop_value)

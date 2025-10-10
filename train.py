@@ -2,6 +2,7 @@ from model import JDCNet
 from meldataset import build_dataloader
 from optimizers import build_optimizer
 from trainer import Trainer
+from losses import build_silence_loss
 
 import time
 import os
@@ -89,15 +90,32 @@ def _train_single_run(config, config_path, run_log_dir):
         head_dropout=float(model_config.get('head_dropout', 0.2)),
     )
 
+    optimizer_params = config.get('optimizer_params', {})
+    scheduler_type = str(optimizer_params.get('scheduler_type', 'one_cycle')).lower()
     scheduler_params = {
-            "max_lr": float(config['optimizer_params'].get('lr', 5e-4)),
-            "pct_start": float(config['optimizer_params'].get('pct_start', 0.0)),
-            "epochs": epochs,
-            "steps_per_epoch": len(train_dataloader),
-        }
+        "type": scheduler_type,
+        "max_lr": float(optimizer_params.get('lr', 5e-4)),
+        "pct_start": float(optimizer_params.get('pct_start', 0.0)),
+        "epochs": epochs,
+        "steps_per_epoch": len(train_dataloader),
+    }
+
+    if scheduler_type in {'reduce_on_plateau', 'plateau'}:
+        min_lr = float(optimizer_params.get('plateau_min_lr', 1e-6))
+        if min_lr < 0.0:
+            min_lr = 0.0
+        scheduler_params.update({
+            "mode": str(optimizer_params.get('plateau_mode', 'max')),
+            "factor": float(optimizer_params.get('plateau_factor', 0.5)),
+            "patience": int(optimizer_params.get('plateau_patience', 3)),
+            "threshold": float(optimizer_params.get('plateau_threshold', 1e-4)),
+            "threshold_mode": str(optimizer_params.get('plateau_threshold_mode', 'rel')),
+            "cooldown": int(optimizer_params.get('plateau_cooldown', 1)),
+            "min_lr": min_lr,
+            "eps": float(optimizer_params.get('plateau_eps', 1e-8)),
+        })
 
     model.to(device)
-    optimizer_params = config.get('optimizer_params', {})
     optimizer, scheduler = build_optimizer(
         {"params": model.parameters(), "optimizer_params": optimizer_params, "scheduler_params": scheduler_params})
 
@@ -106,13 +124,17 @@ def _train_single_run(config, config_path, run_log_dir):
 
     criterion = {
         'f0': nn.SmoothL1Loss(reduction='none', beta=f0_delta),  # F0 loss (regression)
-        'ce': nn.BCEWithLogitsLoss()  # silence loss (binary classification)
+        'ce': build_silence_loss(loss_config)  # silence loss (binary classification)
     }
+
+    trainer_config = {'scheduler_params': scheduler_params,
+                      'early_stop': copy.deepcopy(training_config.get('early_stop', {}))}
 
     trainer = Trainer(model=model,
                         criterion=criterion,
                         optimizer=optimizer,
                         scheduler=scheduler,
+                        config=trainer_config,
                         device=device,
                         train_dataloader=train_dataloader,
                         val_dataloader=val_dataloader,
@@ -121,7 +143,8 @@ def _train_single_run(config, config_path, run_log_dir):
                         use_mixed_precision=training_config.get('mixed_precision', True),
                         gradient_checkpointing=training_config.get('gradient_checkpointing', False),
                         checkpoint_use_reentrant=training_config.get('gradient_checkpointing_use_reentrant'),
-                        ema_decay=training_config.get('ema_decay', 0.0))
+                        ema_decay=training_config.get('ema_decay', 0.0),
+                        scheduler_metric=training_config.get('scheduler_metric', 'eval/vuv_f1'))
 
     if config.get('pretrained_model', '') != '':
         trainer.load_checkpoint(config['pretrained_model'],
@@ -139,6 +162,7 @@ def _train_single_run(config, config_path, run_log_dir):
     for epoch in range(1, epochs+1):
         train_results = trainer._train_epoch()
         eval_results = trainer._eval_epoch()
+        trainer.update_scheduler(eval_results)
         results = train_results.copy()
         results.update(eval_results)
         logger.info('--- epoch %d ---' % epoch)
@@ -156,6 +180,17 @@ def _train_single_run(config, config_path, run_log_dir):
             best_eval_loss = eval_loss
             logger.info('New best model with eval/loss %.4f', best_eval_loss)
             trainer.save_checkpoint(osp.join(run_log_dir, 'best.pth'), use_ema_model=True)
+
+        if trainer.finish_train:
+            logger.info(
+                'Early stopping triggered at epoch %d with learning rate %.6e (threshold %.6e) after %d stagnant epochs on %s.',
+                epoch,
+                trainer._get_lr(),
+                trainer.early_stop_min_lr,
+                getattr(trainer, '_epochs_since_early_stop_improve', 0),
+                trainer.early_stop_metric,
+            )
+            break
 
     writer.close()
     logger.removeHandler(file_handler)
