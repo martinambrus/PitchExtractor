@@ -136,6 +136,8 @@ def _train_single_run(config, config_path, run_log_dir):
     print('All F0 data is computed.')
 
     best_eval_loss = float('inf')
+    best_eval_f1 = float('-inf')
+    best_eval_f0 = float('inf')
     for epoch in range(1, epochs+1):
         train_results = trainer._train_epoch()
         eval_results = trainer._eval_epoch()
@@ -152,9 +154,38 @@ def _train_single_run(config, config_path, run_log_dir):
             trainer.save_checkpoint(osp.join(run_log_dir, 'epoch_%05d.pth' % epoch))
 
         eval_loss = eval_results.get('eval/loss')
-        if eval_loss is not None and eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
-            logger.info('New best model with eval/loss %.4f', best_eval_loss)
+        eval_f1 = eval_results.get('eval/vuv_f1')
+        eval_f0 = eval_results.get('eval/f0')
+
+        new_best = False
+
+        if eval_f1 is not None:
+            if eval_f1 > best_eval_f1 + 1e-9:
+                new_best = True
+            elif abs(eval_f1 - best_eval_f1) <= 1e-9 and eval_f0 is not None:
+                if eval_f0 < best_eval_f0 - 1e-9:
+                    new_best = True
+                elif abs(eval_f0 - best_eval_f0) <= 1e-9 and eval_loss is not None and eval_loss < best_eval_loss - 1e-9:
+                    new_best = True
+        elif eval_loss is not None and eval_loss < best_eval_loss:
+            new_best = True
+
+        if new_best:
+            if eval_f1 is not None:
+                best_eval_f1 = float(eval_f1)
+            if eval_f0 is not None:
+                best_eval_f0 = float(eval_f0)
+            if eval_loss is not None:
+                best_eval_loss = float(eval_loss)
+
+            if eval_f1 is not None:
+                if eval_f0 is not None:
+                    logger.info('New best model with eval/vuv_f1 %.4f (eval/f0 %.4f)', best_eval_f1, best_eval_f0)
+                else:
+                    logger.info('New best model with eval/vuv_f1 %.4f', best_eval_f1)
+            elif eval_loss is not None:
+                logger.info('New best model with eval/loss %.4f', best_eval_loss)
+
             trainer.save_checkpoint(osp.join(run_log_dir, 'best.pth'), use_ema_model=True)
 
     writer.close()
