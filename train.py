@@ -186,6 +186,8 @@ def _train_single_run(config, config_path, run_log_dir):
         if eval_f1 is not None:
             try:
                 f1_value = float(eval_f1)
+                if not math.isfinite(f1_value):
+                    f1_value = None
             except (TypeError, ValueError):
                 f1_value = None
         else:
@@ -194,6 +196,8 @@ def _train_single_run(config, config_path, run_log_dir):
         if eval_f0 is not None:
             try:
                 f0_value = float(eval_f0)
+                if not math.isfinite(f0_value):
+                    f0_value = None
             except (TypeError, ValueError):
                 f0_value = None
         else:
