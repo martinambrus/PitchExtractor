@@ -15,6 +15,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
+import math
 from torch.utils.tensorboard import SummaryWriter
 import click
 from tqdm import tqdm
@@ -159,6 +160,9 @@ def _train_single_run(config, config_path, run_log_dir):
     print('All F0 data is computed.')
 
     best_eval_loss = float('inf')
+    best_eval_f1 = float('-inf')
+    best_eval_f0 = float('inf')
+    metric_epsilon = 1e-9
     for epoch in range(1, epochs+1):
         train_results = trainer._train_epoch()
         eval_results = trainer._eval_epoch()
@@ -175,10 +179,63 @@ def _train_single_run(config, config_path, run_log_dir):
         if (epoch % save_freq) == 0:
             trainer.save_checkpoint(osp.join(run_log_dir, 'epoch_%05d.pth' % epoch))
 
-        eval_loss = eval_results.get('eval/loss')
-        if eval_loss is not None and eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
-            logger.info('New best model with eval/loss %.4f', best_eval_loss)
+        eval_f1 = eval_results.get('eval/vuv_f1')
+        eval_f0 = eval_results.get('eval/f0')
+        improved = False
+
+        if eval_f1 is not None:
+            try:
+                f1_value = float(eval_f1)
+                if not math.isfinite(f1_value):
+                    f1_value = None
+            except (TypeError, ValueError):
+                f1_value = None
+        else:
+            f1_value = None
+
+        if eval_f0 is not None:
+            try:
+                f0_value = float(eval_f0)
+                if not math.isfinite(f0_value):
+                    f0_value = None
+            except (TypeError, ValueError):
+                f0_value = None
+        else:
+            f0_value = None
+
+        if f1_value is not None:
+            if f1_value > best_eval_f1 + metric_epsilon:
+                improved = True
+            elif (
+                abs(f1_value - best_eval_f1) <= metric_epsilon
+                and f0_value is not None
+                and f0_value < best_eval_f0 - metric_epsilon
+            ):
+                improved = True
+
+            if improved:
+                best_eval_f1 = f1_value
+                if f0_value is not None:
+                    best_eval_f0 = f0_value
+        else:
+            eval_loss = eval_results.get('eval/loss')
+            if eval_loss is not None and eval_loss < best_eval_loss:
+                improved = True
+                best_eval_loss = eval_loss
+
+        if improved:
+            if f1_value is not None:
+                if f0_value is not None and math.isfinite(f0_value):
+                    logger.info(
+                        'New best model with eval/vuv_f1 %.4f (eval/f0 %.4f)',
+                        best_eval_f1,
+                        best_eval_f0,
+                    )
+                else:
+                    logger.info('New best model with eval/vuv_f1 %.4f', best_eval_f1)
+            else:
+                logger.info('New best model with eval/loss %.4f', best_eval_loss)
+            trainer.save_checkpoint(osp.join(run_log_dir, 'epoch_%05d.pth' % epoch))
             trainer.save_checkpoint(osp.join(run_log_dir, 'best.pth'), use_ema_model=True)
 
         if trainer.finish_train:

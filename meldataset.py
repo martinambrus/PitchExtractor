@@ -536,6 +536,42 @@ class MelDataset(torch.utils.data.Dataset):
                 end_index = min(cached_f0.shape[0], start_index + int(expected_frames) + 4)
                 return cached_f0[start_index:end_index]
 
+        if (
+            cached_f0 is None
+            and use_cache
+            and expected_frames is not None
+            and not self.data_augmentation
+        ):
+            try:
+                full_wave_tensor, full_wave_sr = self._load_tensor(path)
+            except (FileNotFoundError, LibsndfileError, RuntimeError, OSError, ValueError):
+                full_wave_tensor = None
+            if full_wave_tensor is not None:
+                full_waveform = full_wave_tensor.numpy()
+                if full_waveform.ndim > 1:
+                    full_waveform = np.mean(full_waveform, axis=-1)
+                full_waveform = full_waveform.astype(np.float32)
+                if full_wave_sr != self.sr:
+                    full_waveform = self._resample_waveform(full_waveform, full_wave_sr, self.sr)
+                    full_wave_sr = self.sr
+
+                full_f0 = self._load_or_compute_f0(
+                    path,
+                    full_waveform,
+                    full_wave_sr,
+                    start_sample=0,
+                    expected_frames=None,
+                    use_cache=use_cache,
+                    write_cache=True,
+                )
+
+                hop = max(int(self.mel_params['hop_length']), 1)
+                start_index = max(0, int(math.floor(start_sample / float(hop))))
+                if start_index >= full_f0.shape[0]:
+                    return np.zeros((0,), dtype=np.float32)
+                end_index = min(full_f0.shape[0], start_index + int(expected_frames) + 4)
+                return full_f0[start_index:end_index]
+
         if self.verbose:
             active_backends = self.f0_extractor.describe_backends()
             backend_names = ', '.join(active_backends) if active_backends else 'none'
